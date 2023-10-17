@@ -17,6 +17,7 @@ import static org.junit.Assert.fail;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 import org.eclipse.core.resources.IFile;
 import org.eclipse.core.resources.IProject;
@@ -57,11 +58,13 @@ public class HighlightTest {
 	public void testHighlight() throws CoreException {
 		checkGenericEditorVersion();
 
-		MockLanguageServer.INSTANCE.setDocumentHighlights(List.of( //
-				new DocumentHighlight(new Range(new Position(0, 2), new Position(0, 6)), DocumentHighlightKind.Read),
-				new DocumentHighlight(new Range(new Position(0, 7), new Position(0, 12)), DocumentHighlightKind.Write),
-				new DocumentHighlight(new Range(new Position(0, 13), new Position(0, 17)), DocumentHighlightKind.Text) //
-		));
+		MockLanguageServer.INSTANCE.setDocumentHighlights( //
+				Map.of( //
+					Map.entry(1, List.of( //
+							new DocumentHighlight(new Range(new Position(0, 2), new Position(0, 6)), DocumentHighlightKind.Read),
+							new DocumentHighlight(new Range(new Position(0, 7), new Position(0, 12)), DocumentHighlightKind.Write),
+							new DocumentHighlight(new Range(new Position(0, 13), new Position(0, 17)), DocumentHighlightKind.Text))
+				)));
 
 		final IFile testFile = TestUtils.createUniqueTestFile(project, "  READ WRITE TEXT");
 		final ITextViewer viewer = TestUtils.openTextViewer(testFile);
