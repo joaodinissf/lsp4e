@@ -98,6 +98,7 @@ import org.eclipse.lsp4j.Registration;
 import org.eclipse.lsp4j.RegistrationParams;
 import org.eclipse.lsp4j.SelectionRangeRegistrationOptions;
 import org.eclipse.lsp4j.ServerCapabilities;
+import org.eclipse.lsp4j.ServerInfo;
 import org.eclipse.lsp4j.TextDocumentSyncKind;
 import org.eclipse.lsp4j.TextDocumentSyncOptions;
 import org.eclipse.lsp4j.TypeHierarchyRegistrationOptions;
@@ -251,6 +252,7 @@ public class LanguageServerWrapper {
 	protected final InitializeParams initParams = new InitializeParams();
 
 	private @Nullable CompletableFuture<@Nullable Void> initializeFuture;
+	private @Nullable ServerInfo initializedServerInfo;
 	private final AtomicReference<@Nullable IProgressMonitor> initializeFutureMonitorRef = new AtomicReference<>();
 	private final int initializeFutureNumberOfStages = 7;
 	private @Nullable DefaultLanguageClient languageClient;
@@ -437,6 +439,7 @@ public class LanguageServerWrapper {
 					return initServer(rootURI);
 			}).thenAccept(res -> {
 				synchronized (workingContext) {
+					initializedServerInfo = res.getServerInfo();
 					markInitializationProgress(workingContext);
 					serverCapabilities = res.getCapabilities();
 					this.initiallySupportsWorkspaceFolders = supportsWorkspaceFolders(serverCapabilities);
@@ -893,6 +896,10 @@ public class LanguageServerWrapper {
 			return currentInitializeFuture.thenApply(r -> castNonNull(context.languageServer));
 		}
 		return CompletableFuture.completedFuture(context.languageServer);
+	}
+
+	public ServerInfo getInitializedServerInfo() {
+		return initializedServerInfo;
 	}
 
 	/**
