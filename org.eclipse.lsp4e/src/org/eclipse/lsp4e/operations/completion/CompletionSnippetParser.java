@@ -13,6 +13,7 @@ package org.eclipse.lsp4e.operations.completion;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -33,6 +34,8 @@ class CompletionSnippetParser {
 	private final String snippetText;
 	private final int insertionOffset;
 	private final LinkedHashMap<String, List<LinkedPosition>> linkedPositions = new LinkedHashMap<>();
+	/** The placeholder value of each tabstop, which its later bare occurrences ($1, ${1}) mirror. */
+	private final Map<String, String> placeholderValues = new HashMap<>();
 	private final Function<String, String> getVariableValue;
 	private int snippetOffset = 0;
 	private int snippetToDocumentOffset = 0;
@@ -104,10 +107,12 @@ class CompletionSnippetParser {
 		if (Character.isDigit(firstChar)) {
 			// A tabstop position like $1
 			String key = readNumberKey();
-			snippetToDocumentOffset += key.length() + 1;
-			final var position = new LinkedPosition(document, insertionOffset + snippetOffset - snippetToDocumentOffset, 0);
+			String value = placeholderValues.getOrDefault(key, ""); //$NON-NLS-1$
+			final int start = insertionOffset + snippetOffset - key.length() - 1 - snippetToDocumentOffset;
+			snippetToDocumentOffset += key.length() + 1 - value.length();
+			final var position = new LinkedPosition(document, start, value.length());
 			addLinkedPosition(key, position);
-			return ""; //$NON-NLS-1$
+			return value;
 		} else if (isCharacterForVariableName(firstChar)) {
 			// A Variable like $TM_LINE_NUMBER
 			String key = readVariableKey();
@@ -207,9 +212,10 @@ class CompletionSnippetParser {
 					new CompletionProposal(string, replacementOffset, defaultProposal.length(), replacementOffset + string.length())
 			).toArray(ICompletionProposal[]::new);
 			position = new ProposalPosition(document, insertionOffset + dollarOffset - snippetToDocumentOffset, defaultProposal.length(), proposals);
+			placeholderValues.putIfAbsent(key, defaultProposal);
 		} else {
-			defaultProposal = ""; //$NON-NLS-1$
-			position = new LinkedPosition(document, insertionOffset + dollarOffset - snippetToDocumentOffset, 0);
+			defaultProposal = placeholderValues.getOrDefault(key, ""); //$NON-NLS-1$
+			position = new LinkedPosition(document, insertionOffset + dollarOffset - snippetToDocumentOffset, defaultProposal.length());
 		}
 		addLinkedPosition(key, position);
 		snippetToDocumentOffset += snippetOffset - dollarOffset - defaultProposal.length();

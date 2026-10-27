@@ -455,6 +455,25 @@ public class CompleteCompletionTest extends AbstractCompletionTest {
 	}
 
 	@Test
+	public void testRepeatedTabStopMirrorsItsPlaceholder(MockLanguageServerFactory factory) throws CoreException {
+		CompletionItem completionItem = createCompletionItem("for (${1:i} = 0; $1 < ${2:n}; ${1}++)", CompletionItemKind.Snippet, new Range(new Position(0, 0), new Position(0, 1)));
+		completionItem.setInsertTextFormat(InsertTextFormat.Snippet);
+		factory.withConfiguration((idx, server) -> {
+			server.setCompletionList(new CompletionList(false, List.of(completionItem)));
+		});
+		ITextViewer viewer = TestUtils.openTextViewer(TestUtils.createUniqueTestFile(project,""));
+		int invokeOffset = 0;
+		ICompletionProposal[] proposals = contentAssistProcessor.computeCompletionProposals(viewer, invokeOffset);
+		assertEquals(1, proposals.length);
+		((LSCompletionProposal) proposals[0]).apply(viewer, '\n', 0, invokeOffset);
+		// bare $1 and ${1} mirror the placeholder value of tabstop 1
+		assertEquals("for (i = 0; i < n; i++)", viewer.getDocument().get());
+		// and are linked to it
+		viewer.getTextWidget().insert("j");
+		assertEquals("for (j = 0; j < n; j++)", viewer.getDocument().get());
+	}
+
+	@Test
 	public void testDuplicateVariable(MockLanguageServerFactory factory) throws CoreException {
 		CompletionItem completionItem = createCompletionItem("${1:foo} and ${1:foo}", CompletionItemKind.Class, new Range(new Position(0, 0), new Position(0, 1)));
 		completionItem.setInsertTextFormat(InsertTextFormat.Snippet);
