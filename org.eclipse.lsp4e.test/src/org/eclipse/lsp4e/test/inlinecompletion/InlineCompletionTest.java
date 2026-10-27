@@ -1,0 +1,842 @@
+/*******************************************************************************
+ * Copyright (c) 2026 Contributors to the Eclipse Foundation.
+ * This program and the accompanying materials are made
+ * available under the terms of the Eclipse Public License 2.0
+ * which is available at https://www.eclipse.org/legal/epl-2.0/
+ *
+ * SPDX-License-Identifier: EPL-2.0
+ *******************************************************************************/
+package org.eclipse.lsp4e.test.inlinecompletion;
+
+import static org.eclipse.lsp4e.internal.NullSafetyHelper.castNonNull;
+import static org.eclipse.lsp4e.test.utils.TestUtils.waitForAndAssertCondition;
+import static org.junit.jupiter.api.Assertions.*;
+
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
+import java.util.function.Supplier;
+
+import org.eclipse.core.resources.IFile;
+import org.eclipse.core.runtime.ILogListener;
+import org.eclipse.core.runtime.IStatus;
+import org.eclipse.core.runtime.NullProgressMonitor;
+import org.eclipse.core.runtime.Platform;
+import org.eclipse.core.runtime.preferences.InstanceScope;
+import org.eclipse.jface.bindings.TriggerSequence;
+import org.eclipse.jface.bindings.keys.KeySequence;
+import org.eclipse.jface.preference.IPreferenceStore;
+import org.eclipse.jface.text.IDocument;
+import org.eclipse.jface.text.ITextOperationTarget;
+import org.eclipse.jface.text.codemining.ICodeMining;
+import org.eclipse.jface.text.codemining.ICodeMiningProvider;
+import org.eclipse.jface.text.link.LinkedModeModel;
+import org.eclipse.jface.text.source.ISourceViewer;
+import org.eclipse.lsp4e.LanguageServerPlugin;
+import org.eclipse.lsp4e.LanguageServers;
+import org.eclipse.lsp4e.internal.LSPMethods;
+import org.eclipse.lsp4e.internal.SupportedFeatures;
+import org.eclipse.lsp4e.operations.codelens.CodeLensProvider;
+import org.eclipse.lsp4e.operations.inlayhint.InlayHintProvider;
+import org.eclipse.lsp4e.operations.inlinecompletion.GhostText;
+import org.eclipse.lsp4e.operations.inlinecompletion.GhostTextLayout.Kind;
+import org.eclipse.lsp4e.operations.inlinecompletion.GhostTextLayout.MiningSpec;
+import org.eclipse.lsp4e.operations.inlinecompletion.InlineCompletionController;
+import org.eclipse.lsp4e.test.utils.AbstractTestWithProject;
+import org.eclipse.lsp4e.test.utils.TestUtils;
+import org.eclipse.lsp4e.tests.mock.MockLanguageServer;
+import org.eclipse.lsp4e.tests.mock.MockLanguageServerFactory;
+import org.eclipse.lsp4e.ui.InlineCompletionPreferencePage;
+import org.eclipse.lsp4e.ui.UI;
+import org.eclipse.lsp4j.CodeLens;
+import org.eclipse.lsp4j.Command;
+import org.eclipse.lsp4j.ExecuteCommandParams;
+import org.eclipse.lsp4j.InlayHint;
+import org.eclipse.lsp4j.InlineCompletionItem;
+import org.eclipse.lsp4j.InlineCompletionList;
+import org.eclipse.lsp4j.InlineCompletionParams;
+import org.eclipse.lsp4j.InlineCompletionTriggerKind;
+import org.eclipse.lsp4j.Position;
+import org.eclipse.lsp4j.Range;
+import org.eclipse.lsp4j.Registration;
+import org.eclipse.lsp4j.RegistrationParams;
+import org.eclipse.lsp4j.ServerCapabilities;
+import org.eclipse.lsp4j.StringValue;
+import org.eclipse.lsp4j.StringValueKind;
+import org.eclipse.lsp4j.Unregistration;
+import org.eclipse.lsp4j.UnregistrationParams;
+import org.eclipse.lsp4j.jsonrpc.ResponseErrorException;
+import org.eclipse.lsp4j.jsonrpc.messages.Either;
+import org.eclipse.lsp4j.jsonrpc.messages.ResponseError;
+import org.eclipse.lsp4j.jsonrpc.messages.ResponseErrorCode;
+import org.eclipse.swt.SWT;
+import org.eclipse.swt.custom.StyledText;
+import org.eclipse.swt.graphics.Point;
+import org.eclipse.swt.widgets.Display;
+import org.eclipse.swt.widgets.Event;
+import org.eclipse.ui.IEditorPart;
+import org.eclipse.ui.PlatformUI;
+import org.eclipse.ui.handlers.IHandlerService;
+import org.eclipse.ui.keys.IBindingService;
+import org.eclipse.ui.preferences.ScopedPreferenceStore;
+import org.eclipse.ui.tests.harness.util.DisplayHelper;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+/**
+ * Integration tests of inline completions in the generic editor, against the mock language server.
+ * What ghost text is computed and how it is laid out is tested by {@link GhostTextModelTest}; these
+ * tests cover requests, keys, accepting and the interplay with the editor.
+ * <p>
+ * Ghost text is dismissed when the editor loses focus, so these tests need the workbench window to
+ * keep the focus while they run.
+ */
+public class InlineCompletionTest extends AbstractTestWithProject {
+
+	private static final int TIMEOUT = 5_000;
+	/** How long the mock server takes to answer in the latency tests. */
+	private static final int SLOW = 300;
+	private static final String FAILURE = "mock inline completion failure";
+
+	private static final String AUTO_ACTIVATION = "contentAssistant.autoActivation";
+	private static final String AUTO_ACTIVATION_ON_TYPE = "contentAssistant.autoActivationOnType";
+
+	private final IPreferenceStore store = LanguageServerPlugin.getDefault().getPreferenceStore();
+	/**
+	 * The generic editor opens the completion popup while typing, and the mock server proposes a
+	 * completion: its selection would be sent along and change what is requested. Popup interplay is
+	 * tested by {@link InlineCompletionWithCompletionPopupTest}; here it is switched off.
+	 */
+	private final IPreferenceStore genericEditorStore = new ScopedPreferenceStore(InstanceScope.INSTANCE,
+			"org.eclipse.ui.genericeditor");
+
+	@BeforeEach
+	public void setUpPreferences() {
+		store.setValue(InlineCompletionPreferencePage.PREF_AUTOMATIC, true);
+		store.setValue(InlineCompletionPreferencePage.PREF_DELAY, 20);
+		genericEditorStore.setValue(AUTO_ACTIVATION, false);
+		genericEditorStore.setValue(AUTO_ACTIVATION_ON_TYPE, false);
+	}
+
+	@AfterEach
+	public void resetPreferences() {
+		store.setToDefault(InlineCompletionPreferencePage.PREF_AUTOMATIC);
+		store.setToDefault(InlineCompletionPreferencePage.PREF_DELAY);
+		genericEditorStore.setToDefault(AUTO_ACTIVATION);
+		genericEditorStore.setToDefault(AUTO_ACTIVATION_ON_TYPE);
+	}
+
+	static ServerCapabilities capabilities() {
+		final ServerCapabilities capabilities = MockLanguageServer.defaultServerCapabilities();
+		capabilities.setInlineCompletionProvider(true);
+		return capabilities;
+	}
+
+	static Function<InlineCompletionParams, Either<List<InlineCompletionItem>, InlineCompletionList>> items(
+			InlineCompletionItem... items) {
+		return params -> Either.forLeft(List.of(items));
+	}
+
+	static InlineCompletionItem item(String text) {
+		final var item = new InlineCompletionItem();
+		item.setInsertText(text);
+		return item;
+	}
+
+	static InlineCompletionItem item(String text, int line, int startCharacter, int endCharacter) {
+		final var item = new InlineCompletionItem();
+		item.setInsertText(text);
+		item.setRange(new Range(new Position(line, startCharacter), new Position(line, endCharacter)));
+		return item;
+	}
+
+	/** A server error with {@link #FAILURE} as its message. */
+	private static Either<List<InlineCompletionItem>, InlineCompletionList> fail() {
+		throw new ResponseErrorException(new ResponseError(ResponseErrorCode.InternalError, FAILURE, null));
+	}
+
+	private ISourceViewer open(MockLanguageServerFactory factory, String content,
+			Function<InlineCompletionParams, Either<List<InlineCompletionItem>, InlineCompletionList>> responder)
+			throws Exception {
+		return open(factory, "lspt", content, InlineCompletionTest::capabilities, responder);
+	}
+
+	private ISourceViewer open(MockLanguageServerFactory factory, String extension, String content,
+			Supplier<ServerCapabilities> capabilities,
+			Function<InlineCompletionParams, Either<List<InlineCompletionItem>, InlineCompletionList>> responder)
+			throws Exception {
+		factory.withCapabilities(capabilities);
+		factory.withConfiguration((index, server) -> server.getTextDocumentService().setInlineCompletionResponder(responder));
+		return openEditor(TestUtils.createUniqueTestFile(project, extension, content));
+	}
+
+	/** Opens the file and waits until inline completions can be requested in it. */
+	static ISourceViewer openEditor(IFile file) throws Exception {
+		final var viewer = (ISourceViewer) TestUtils.openTextViewer(file);
+		waitForAndAssertCondition(TIMEOUT, () -> InlineCompletionController.get(viewer) != null);
+		waitForAndAssertCondition(TIMEOUT, () -> LanguageServers.forDocument(viewer.getDocument()).anyMatching());
+		viewer.getTextWidget().forceFocus();
+		return viewer;
+	}
+
+	static InlineCompletionController controller(ISourceViewer viewer) {
+		final InlineCompletionController controller = InlineCompletionController.get(viewer);
+		assertNotNull(controller);
+		return controller;
+	}
+
+	static GhostText waitForGhost(ISourceViewer viewer) {
+		waitForAndAssertCondition("ghost text shown", TIMEOUT, () -> controller(viewer).getShownGhostText() != null);
+		return castNonNull(controller(viewer).getShownGhostText());
+	}
+
+	static void waitForGhostText(ISourceViewer viewer, String text) {
+		waitForAndAssertCondition("ghost text \"" + text + "\" shown", TIMEOUT, () -> {
+			final GhostText ghost = controller(viewer).getShownGhostText();
+			assertNotNull(ghost);
+			assertEquals(text, ghost.text());
+		});
+	}
+
+	static void waitForNoGhost(ISourceViewer viewer) {
+		waitForAndAssertCondition("no ghost text", TIMEOUT, () -> controller(viewer).getShownGhostText() == null);
+	}
+
+	/** Lets queued UI work run, for checks that something does not happen. */
+	static void processEvents(int millis) {
+		final Display display = UI.getDisplay();
+		DisplayHelper.sleep(display, millis);
+	}
+
+	static void setCaret(ISourceViewer viewer, int offset) {
+		viewer.setSelectedRange(offset, 0);
+	}
+
+	/** Types like the user: through StyledText's key handling, verify-key listeners included. */
+	static void type(ISourceViewer viewer, char character) {
+		final StyledText widget = viewer.getTextWidget();
+		final var event = new Event();
+		event.widget = widget;
+		event.character = character;
+		event.keyCode = character;
+		widget.notifyListeners(SWT.KeyDown, event);
+		processEvents(0);
+	}
+
+	static void type(ISourceViewer viewer, String text) {
+		for (final char c : text.toCharArray()) {
+			type(viewer, c);
+		}
+	}
+
+	private static MockLanguageServer server(MockLanguageServerFactory factory) {
+		return factory.getServer();
+	}
+
+	private static int requestCount(MockLanguageServerFactory factory) {
+		return server(factory).getTextDocumentService().inlineCompletionRequests.size();
+	}
+
+	private static InlineCompletionParams lastRequest(MockLanguageServerFactory factory) {
+		final List<InlineCompletionParams> requests = List.copyOf(server(factory).getTextDocumentService().inlineCompletionRequests);
+		assertFalse(requests.isEmpty());
+		return requests.get(requests.size() - 1);
+	}
+
+	/** Counts the errors LSP4E logs because of {@link #fail()}. */
+	private static final class FailureCounter implements ILogListener, AutoCloseable {
+		final AtomicInteger count = new AtomicInteger();
+
+		FailureCounter() {
+			Platform.addLogListener(this);
+		}
+
+		@Override
+		public void logging(IStatus status, String plugin) {
+			if (status.getSeverity() == IStatus.ERROR && LanguageServerPlugin.PLUGIN_ID.equals(status.getPlugin())
+					&& String.valueOf(status.getMessage()).contains(FAILURE)) {
+				count.incrementAndGet();
+			}
+		}
+
+		@Override
+		public void close() {
+			Platform.removeLogListener(this);
+		}
+	}
+
+	// ---- capabilities, servers and commands ------------------------------------------------------------
+
+	@Test
+	public void requestsAreSentOnlyWhileTheCapabilityIsRegistered(MockLanguageServerFactory factory) throws Exception {
+		final var inlineCompletion = SupportedFeatures.getTextDocumentClientCapabilities().getInlineCompletion();
+		assertNotNull(inlineCompletion);
+		assertEquals(Boolean.TRUE, inlineCompletion.getDynamicRegistration());
+
+		final ISourceViewer viewer = open(factory, "lspt", "hello\n", MockLanguageServer::defaultServerCapabilities,
+				items(item(" world")));
+		final String id = UUID.randomUUID().toString();
+		server(factory).getRemoteProxy()
+				.registerCapability(new RegistrationParams(List.of(new Registration(id, LSPMethods.TEXT_DOCUMENT_INLINE_COMPLETION))))
+				.get(TIMEOUT, TimeUnit.MILLISECONDS);
+		setCaret(viewer, 5);
+		controller(viewer).trigger();
+		waitForGhostText(viewer, " world");
+
+		controller(viewer).dismiss();
+		server(factory).getRemoteProxy()
+				.unregisterCapability(new UnregistrationParams(List.of(new Unregistration(id, LSPMethods.TEXT_DOCUMENT_INLINE_COMPLETION))))
+				.get(TIMEOUT, TimeUnit.MILLISECONDS);
+		final int requests = requestCount(factory);
+		controller(viewer).trigger();
+		processEvents(300);
+		assertEquals(requests, requestCount(factory));
+	}
+
+	@Test
+	public void candidatesOfSeveralServersAreMerged(MockLanguageServerFactory factory) throws Exception {
+		factory.withCapabilities(InlineCompletionTest::capabilities);
+		factory.withConfiguration((index, server) -> server.getTextDocumentService()
+				.setInlineCompletionResponder(items(item(" from server " + index))));
+		final ISourceViewer viewer = openEditor(TestUtils.createUniqueTestFile(project, "lsptmultils", "hello\n"));
+		waitForAndAssertCondition(TIMEOUT, () -> factory.getServerCount() == 2);
+		setCaret(viewer, 5);
+		controller(viewer).trigger();
+		waitForAndAssertCondition(TIMEOUT, () -> {
+			final var session = controller(viewer).getSession();
+			assertNotNull(session);
+			assertEquals(2, session.size());
+		});
+	}
+
+	@Test
+	public void aFailingServerDoesNotHideTheOthersSuggestions(MockLanguageServerFactory factory) throws Exception {
+		factory.withCapabilities(InlineCompletionTest::capabilities);
+		factory.withConfiguration((index, server) -> server.getTextDocumentService()
+				.setInlineCompletionResponder(index == 0 ? params -> fail() : items(item(" from server " + index))));
+		final ISourceViewer viewer = openEditor(TestUtils.createUniqueTestFile(project, "lsptmultils", "hello\n"));
+		waitForAndAssertCondition(TIMEOUT, () -> factory.getServerCount() == 2);
+		try (var failures = new FailureCounter()) {
+			setCaret(viewer, 5);
+			controller(viewer).trigger();
+			waitForGhostText(viewer, " from server 1");
+			waitForAndAssertCondition(TIMEOUT, () -> failures.count.get() == 1);
+		}
+	}
+
+	@Test
+	public void aFailingServerIsLoggedOnce(MockLanguageServerFactory factory) throws Exception {
+		final ISourceViewer viewer = open(factory, "hello\n", params -> fail());
+		try (var failures = new FailureCounter()) {
+			setCaret(viewer, 5);
+			for (int i = 1; i <= 3; i++) {
+				controller(viewer).trigger();
+				final int expected = i;
+				waitForAndAssertCondition(TIMEOUT, () -> requestCount(factory) == expected);
+				waitForAndAssertCondition(TIMEOUT, () -> failures.count.get() == 1);
+			}
+			processEvents(100);
+			assertEquals(1, failures.count.get());
+		}
+	}
+
+	@Test
+	public void triggerIsBoundToThePlatformsKey(MockLanguageServerFactory factory) throws Exception {
+		open(factory, "hello\n", items(item(" world")));
+		final IBindingService bindings = PlatformUI.getWorkbench().getService(IBindingService.class);
+		// macOS: Option+key types a character, so Ctrl is used there
+		final boolean mac = Platform.OS_MACOSX.equals(Platform.getOS());
+		final KeySequence expected = KeySequence.getInstance(mac ? "M4+\\" : "M3+\\");
+		final List<TriggerSequence> active = List.of(bindings.getActiveBindingsFor("org.eclipse.lsp4e.inlineCompletion.trigger"));
+		assertTrue(active.contains(expected), "active bindings: " + active);
+		if (mac) {
+			assertFalse(active.contains(KeySequence.getInstance("M3+\\")), "active bindings: " + active);
+		}
+	}
+
+	@Test
+	public void commandsWorkThroughTheHandlerService(MockLanguageServerFactory factory) throws Exception {
+		// as a key binding runs them, so that the handlers' activeWhen is evaluated
+		final ISourceViewer viewer = open(factory, "hello\n", items(item(" a"), item(" b")));
+		setCaret(viewer, 5);
+		final IHandlerService handlers = PlatformUI.getWorkbench().getService(IHandlerService.class);
+		handlers.executeCommand("org.eclipse.lsp4e.inlineCompletion.trigger", null);
+		waitForGhostText(viewer, " a");
+		assertEquals(InlineCompletionTriggerKind.Invoked, lastRequest(factory).getContext().getTriggerKind());
+		handlers.executeCommand("org.eclipse.lsp4e.inlineCompletion.next", null);
+		waitForGhostText(viewer, " b");
+		handlers.executeCommand("org.eclipse.lsp4e.inlineCompletion.previous", null);
+		waitForGhostText(viewer, " a");
+		handlers.executeCommand("org.eclipse.lsp4e.inlineCompletion.accept", null);
+		assertEquals("hello a\n", viewer.getDocument().get());
+	}
+
+	// ---- requests and keys -----------------------------------------------------------------------------
+
+	@Test
+	public void explicitTriggerSendsAnInvokedRequestAndShowsTheGhostAtTheEndOfALine(
+			MockLanguageServerFactory factory) throws Exception {
+		final ISourceViewer viewer = open(factory, "hello\nsecond line\n", items(item(" world")));
+		setCaret(viewer, 5);
+		controller(viewer).trigger();
+		waitForGhostText(viewer, " world");
+
+		final InlineCompletionParams params = lastRequest(factory);
+		assertEquals(InlineCompletionTriggerKind.Invoked, params.getContext().getTriggerKind());
+		assertNull(params.getContext().getSelectedCompletionInfo());
+		assertEquals(new Position(0, 5), params.getPosition());
+		// drawn on the line delimiter
+		assertEquals(List.of(new MiningSpec(Kind.CONTENT, 5, 1, " world", List.of())), controller(viewer).getShownLayout());
+	}
+
+	@Test
+	public void typingThroughShrinksTheGhostWithoutNewRequests(MockLanguageServerFactory factory) throws Exception {
+		final ISourceViewer viewer = open(factory, "hel\n", items(item("o world")));
+		setCaret(viewer, 3);
+		type(viewer, 'l');
+		waitForGhostText(viewer, "o world");
+		assertEquals(InlineCompletionTriggerKind.Automatic, lastRequest(factory).getContext().getTriggerKind());
+		final int requests = requestCount(factory);
+
+		type(viewer, "o w");
+		waitForGhostText(viewer, "orld");
+		assertEquals(requests, requestCount(factory), "typing through must not request again");
+
+		// fully typed: the session ends and a new automatic request follows
+		type(viewer, "orld");
+		waitForAndAssertCondition(TIMEOUT, () -> requestCount(factory) > requests);
+	}
+
+	@Test
+	public void aNonMatchingCharacterDismissesAndRequestsAgain(MockLanguageServerFactory factory) throws Exception {
+		final ISourceViewer viewer = open(factory, "hello\n", items(item(" world")));
+		setCaret(viewer, 5);
+		controller(viewer).trigger();
+		waitForGhostText(viewer, " world");
+		final int requests = requestCount(factory);
+
+		type(viewer, 'x');
+		waitForAndAssertCondition(TIMEOUT, () -> requestCount(factory) > requests);
+	}
+
+	@Test
+	public void backspaceInsideTheReplacedRangeGrowsTheGhostBack(MockLanguageServerFactory factory) throws Exception {
+		final ISourceViewer viewer = open(factory, "co\n", items(item("console", 0, 0, 2)));
+		setCaret(viewer, 2);
+		controller(viewer).trigger();
+		waitForGhostText(viewer, "nsole");
+
+		type(viewer, SWT.BS);
+		waitForGhostText(viewer, "onsole");
+	}
+
+	@Test
+	public void tabAcceptsAndUndoRestores(MockLanguageServerFactory factory) throws Exception {
+		final ISourceViewer viewer = open(factory, "hello\n", items(item(" world")));
+		setCaret(viewer, 5);
+		controller(viewer).trigger();
+		waitForGhostText(viewer, " world");
+		waitForAndAssertCondition(TIMEOUT, () -> controller(viewer).isGhostPainted());
+
+		type(viewer, SWT.TAB);
+		assertEquals("hello world\n", viewer.getDocument().get());
+		assertEquals(11, viewer.getSelectedRange().x);
+		waitForNoGhost(viewer);
+
+		final var target = (ITextOperationTarget) viewer;
+		target.doOperation(ITextOperationTarget.UNDO);
+		assertEquals("hello\n", viewer.getDocument().get());
+		target.doOperation(ITextOperationTarget.REDO);
+		assertEquals("hello world\n", viewer.getDocument().get());
+		processEvents(200);
+		assertNull(controller(viewer).getShownGhostText(), "no ghost text reappears after redo");
+	}
+
+	@Test
+	public void tabWithoutGhostKeepsItsMeaning(MockLanguageServerFactory factory) throws Exception {
+		final ISourceViewer viewer = open(factory, "hello\n", items());
+		store.setValue(InlineCompletionPreferencePage.PREF_AUTOMATIC, false);
+		setCaret(viewer, 5);
+		type(viewer, SWT.TAB);
+		assertEquals("hello\t\n", viewer.getDocument().get());
+	}
+
+	@Test
+	public void escapeDismisses(MockLanguageServerFactory factory) throws Exception {
+		final ISourceViewer viewer = open(factory, "hello\n", items(item(" world")));
+		setCaret(viewer, 5);
+		controller(viewer).trigger();
+		waitForGhostText(viewer, " world");
+		type(viewer, SWT.ESC);
+		waitForNoGhost(viewer);
+		assertEquals("hello\n", viewer.getDocument().get());
+	}
+
+	@Test
+	public void movingTheCaretDismissesAlsoAfterAnEarlierAccept(MockLanguageServerFactory factory) throws Exception {
+		final ISourceViewer viewer = open(factory, "hello\nhello\n", items(item(" world")));
+		setCaret(viewer, 5);
+		controller(viewer).trigger();
+		waitForGhostText(viewer, " world");
+		controller(viewer).accept();
+		assertEquals("hello world\nhello\n", viewer.getDocument().get());
+
+		setCaret(viewer, 17);
+		controller(viewer).trigger();
+		waitForGhostText(viewer, " world");
+		setCaret(viewer, 3);
+		waitForNoGhost(viewer);
+	}
+
+	@Test
+	public void anEditAwayFromTheCaretDismissesAndCancels(MockLanguageServerFactory factory) throws Exception {
+		// as a formatter or a refactoring makes them; this one does not move the caret
+		final ISourceViewer viewer = open(factory, "hello\nsecond\n", items(item(" world")));
+		final IDocument document = viewer.getDocument();
+		setCaret(viewer, 5);
+		controller(viewer).trigger();
+		waitForGhostText(viewer, " world");
+		document.replace(12, 0, "!");
+		waitForNoGhost(viewer);
+
+		server(factory).setTimeToProceedQueries(SLOW);
+		controller(viewer).trigger();
+		waitForAndAssertCondition(TIMEOUT, () -> requestCount(factory) == 2);
+		document.replace(13, 0, "!");
+		waitForAndAssertCondition(TIMEOUT, () -> factory.cancellations.size() == 1);
+		processEvents(SLOW + 200);
+		assertNull(controller(viewer).getShownGhostText());
+	}
+
+	@Test
+	public void losingTheFocusDismissesAndCancels(MockLanguageServerFactory factory) throws Exception {
+		final ISourceViewer viewer = open(factory, "hello\n", items(item(" world")));
+		setCaret(viewer, 5);
+		controller(viewer).trigger();
+		waitForGhostText(viewer, " world");
+		viewer.getTextWidget().notifyListeners(SWT.FocusOut, new Event());
+		waitForNoGhost(viewer);
+
+		server(factory).setTimeToProceedQueries(SLOW);
+		controller(viewer).trigger();
+		waitForAndAssertCondition(TIMEOUT, () -> requestCount(factory) == 2);
+		viewer.getTextWidget().notifyListeners(SWT.FocusOut, new Event());
+		waitForAndAssertCondition(TIMEOUT, () -> factory.cancellations.size() == 1);
+	}
+
+	@Test
+	public void cyclingASingleAutomaticResultRequestsAlternatives(MockLanguageServerFactory factory) throws Exception {
+		final ISourceViewer viewer = open(factory, "hel\n", params -> Either.forLeft(
+				params.getContext().getTriggerKind() == InlineCompletionTriggerKind.Automatic ? List.of(item("o"))
+						: List.of(item("o"), item("p"))));
+		setCaret(viewer, 3);
+		type(viewer, 'l');
+		waitForGhostText(viewer, "o");
+		controller(viewer).cycle(true);
+		waitForAndAssertCondition(TIMEOUT, () -> {
+			assertEquals(InlineCompletionTriggerKind.Invoked, lastRequest(factory).getContext().getTriggerKind());
+			final var session = controller(viewer).getSession();
+			assertNotNull(session);
+			assertEquals(2, session.size());
+		});
+	}
+
+	@Test
+	public void automaticRequestsCanBeDisabled(MockLanguageServerFactory factory) throws Exception {
+		final ISourceViewer viewer = open(factory, "hel\n", items(item("o")));
+		store.setValue(InlineCompletionPreferencePage.PREF_AUTOMATIC, false);
+		setCaret(viewer, 3);
+		type(viewer, 'l');
+		processEvents(300);
+		assertEquals(0, requestCount(factory));
+		// explicit requests still work
+		controller(viewer).trigger();
+		waitForGhostText(viewer, "o");
+	}
+
+	@Test
+	public void noRequestWithASelectionOrInAReadOnlyViewer(MockLanguageServerFactory factory) throws Exception {
+		final ISourceViewer viewer = open(factory, "hello\n", items(item(" world")));
+		viewer.setSelectedRange(0, 5);
+		controller(viewer).trigger();
+		viewer.setEditable(false);
+		setCaret(viewer, 5);
+		controller(viewer).trigger();
+		processEvents(300);
+		assertEquals(0, requestCount(factory));
+	}
+
+	// ---- accepting -------------------------------------------------------------------------------------
+
+	@Test
+	public void closingParenthesisAfterTheCaretIsNotDoubled(MockLanguageServerFactory factory) throws Exception {
+		final ISourceViewer viewer = open(factory, "print()\n", items(item("\"hi\")", 0, 6, 7)));
+		setCaret(viewer, 6);
+		controller(viewer).trigger();
+		// the ")" already in the document is not part of the ghost text
+		waitForGhostText(viewer, "\"hi\"");
+		controller(viewer).accept();
+		assertEquals("print(\"hi\")\n", viewer.getDocument().get());
+	}
+
+	@Test
+	public void multiLineGhostContinuesAboveTheNextLineAndIsInsertedAsIs(MockLanguageServerFactory factory)
+			throws Exception {
+		final ISourceViewer viewer = open(factory, "def f():\nx\n", items(item("\n    return\t1")));
+		setCaret(viewer, 8);
+		controller(viewer).trigger();
+		waitForGhost(viewer);
+		// no inline part: the line is drawn above line 1, with its tab expanded
+		final List<MiningSpec> layout = controller(viewer).getShownLayout();
+		assertEquals(1, layout.size());
+		assertEquals(Kind.HEADER, layout.get(0).kind());
+		assertEquals(9, layout.get(0).offset());
+		assertEquals("", layout.get(0).firstRow());
+		assertFalse(layout.get(0).rows().get(0).contains("\t"), "drawn: " + layout.get(0).rows());
+		// inserted as is: neither re-indented nor with the tab expanded
+		controller(viewer).accept();
+		assertEquals("def f():\n    return\t1\nx\n", viewer.getDocument().get());
+	}
+
+	@Test
+	public void hugeSuggestionIsInsertedWhole(MockLanguageServerFactory factory) throws Exception {
+		// the preview is truncated (see GhostTextModelTest), the insertion is not
+		final var text = new StringBuilder();
+		for (int i = 1; i <= 60; i++) {
+			text.append("\nline ").append(i);
+		}
+		final ISourceViewer viewer = open(factory, "x\ny\n", items(item(text.toString())));
+		setCaret(viewer, 1);
+		controller(viewer).trigger();
+		waitForGhost(viewer);
+		controller(viewer).accept();
+		assertEquals("x" + text + "\ny\n", viewer.getDocument().get());
+	}
+
+	@Test
+	public void endOfDocumentReservesRoomBelowTheLastLine(MockLanguageServerFactory factory) throws Exception {
+		final ISourceViewer viewer = open(factory, "abc", items(item("x\ny\nz")));
+		final int margin = viewer.getTextWidget().getBottomMargin();
+		setCaret(viewer, 3);
+		controller(viewer).trigger();
+		waitForGhost(viewer);
+		assertEquals(List.of(new MiningSpec(Kind.END_OF_DOCUMENT, 3, 0, "x", List.of("y", "z"))),
+				controller(viewer).getShownLayout());
+		assertTrue(viewer.getTextWidget().getBottomMargin() > margin);
+
+		controller(viewer).dismiss();
+		assertEquals(margin, viewer.getTextWidget().getBottomMargin());
+	}
+
+	@Test
+	public void emptyDocument(MockLanguageServerFactory factory) throws Exception {
+		final ISourceViewer viewer = open(factory, "", items(item("first line")));
+		setCaret(viewer, 0);
+		controller(viewer).trigger();
+		waitForGhostText(viewer, "first line");
+		waitForAndAssertCondition(TIMEOUT, () -> controller(viewer).isGhostPainted());
+		controller(viewer).accept();
+		assertEquals("first line", viewer.getDocument().get());
+	}
+
+	@Test
+	public void snippetsArePreviewedExpandedAndAcceptedInLinkedMode(MockLanguageServerFactory factory) throws Exception {
+		final var snippet = new InlineCompletionItem();
+		snippet.setInsertText(new StringValue(StringValueKind.SNIPPET, "foo(${1:a}, ${2:b})$0"));
+		final ISourceViewer viewer = open(factory, "\n", items(snippet));
+		setCaret(viewer, 0);
+		controller(viewer).trigger();
+		waitForGhostText(viewer, "foo(a, b)");
+		controller(viewer).accept();
+		final IDocument document = viewer.getDocument();
+		assertEquals("foo(a, b)\n", document.get());
+		assertTrue(LinkedModeModel.hasInstalledModel(document));
+		// the first placeholder is selected
+		assertEquals(new Point(4, 1), viewer.getSelectedRange());
+
+		// typing a placeholder does not request inline completions
+		final int requests = requestCount(factory);
+		type(viewer, 'z');
+		processEvents(300);
+		assertEquals("foo(z, b)\n", document.get());
+		assertEquals(requests, requestCount(factory));
+	}
+
+	@Test
+	public void commandIsExecutedAfterAccept(MockLanguageServerFactory factory) throws Exception {
+		final InlineCompletionItem withCommand = item(" world");
+		withCommand.setCommand(new Command("after", MockLanguageServer.SUPPORTED_COMMAND_ID, List.of("arg")));
+		final ISourceViewer viewer = open(factory, "hello\n", items(withCommand));
+		setCaret(viewer, 5);
+		controller(viewer).trigger();
+		waitForGhost(viewer);
+		controller(viewer).accept();
+		final ExecuteCommandParams executed = server(factory).getWorkspaceService().getExecutedCommand().get(TIMEOUT,
+				TimeUnit.MILLISECONDS);
+		assertEquals(MockLanguageServer.SUPPORTED_COMMAND_ID, executed.getCommand());
+		assertEquals("hello world\n", viewer.getDocument().get());
+	}
+
+	@Test
+	public void acceptedTextIsNotTreatedAsTyping(MockLanguageServerFactory factory) throws Exception {
+		final ISourceViewer viewer = open(factory, "hello\n", items(item(" world")));
+		setCaret(viewer, 5);
+		controller(viewer).trigger();
+		waitForGhost(viewer);
+		final int requests = requestCount(factory);
+		controller(viewer).accept();
+		processEvents(300);
+		assertEquals(requests, requestCount(factory), "accepting must not trigger an automatic request");
+	}
+
+	// ---- server latency: one request at a time, kept while the user types at the caret -----------------
+
+	@Test
+	public void typingThatDoesNotFitDropsTheReplyAndAsksAgain(MockLanguageServerFactory factory) throws Exception {
+		final ISourceViewer viewer = open(factory, "hello\n", items(item(" world")));
+		server(factory).setTimeToProceedQueries(SLOW);
+		store.setValue(InlineCompletionPreferencePage.PREF_AUTOMATIC, false);
+		setCaret(viewer, 5);
+		controller(viewer).trigger();
+		waitForAndAssertCondition(TIMEOUT, () -> requestCount(factory) == 1);
+		// typing that the reply cannot fit: it is not shown, and the request is repeated for the new text
+		type(viewer, '!');
+		waitForAndAssertCondition(TIMEOUT, () -> requestCount(factory) == 2);
+		assertEquals(InlineCompletionTriggerKind.Invoked, lastRequest(factory).getContext().getTriggerKind());
+		assertEquals(new Position(0, 6), lastRequest(factory).getPosition());
+		final GhostText ghost = waitForGhost(viewer);
+		assertEquals(6, ghost.anchor());
+		assertEquals(0, factory.cancellations.size(), "typing does not cancel the request");
+	}
+
+	@Test
+	public void typingThatFitsKeepsTheRequestAndShowsItsReplyShortened(MockLanguageServerFactory factory)
+			throws Exception {
+		final ISourceViewer viewer = open(factory, "hello\n", items(item(" world"), item(" wide")));
+		server(factory).setTimeToProceedQueries(SLOW);
+		setCaret(viewer, 5);
+		controller(viewer).trigger();
+		waitForAndAssertCondition(TIMEOUT, () -> requestCount(factory) == 1);
+		// the automatic request this typing would trigger is held back
+		type(viewer, " w");
+		waitForGhostText(viewer, "orld");
+		// the reply is still the explicit request's: all its alternatives are there
+		controller(viewer).cycle(true);
+		waitForGhostText(viewer, "ide");
+		assertEquals(1, requestCount(factory), "one request at a time");
+		assertEquals(0, factory.cancellations.size());
+	}
+
+	@Test
+	public void movingTheCaretCancelsTheRequest(MockLanguageServerFactory factory) throws Exception {
+		final ISourceViewer viewer = open(factory, "hello\nsecond\n", items(item(" world")));
+		server(factory).setTimeToProceedQueries(SLOW);
+		setCaret(viewer, 5);
+		controller(viewer).trigger();
+		waitForAndAssertCondition(TIMEOUT, () -> requestCount(factory) == 1);
+		setCaret(viewer, 8);
+		waitForAndAssertCondition(TIMEOUT, () -> factory.cancellations.size() == 1);
+		processEvents(SLOW + 200);
+		assertNull(controller(viewer).getShownGhostText());
+	}
+
+	@Test
+	public void anExplicitRequestReplacesOneTheServerDoesNotAnswer(MockLanguageServerFactory factory)
+			throws Exception {
+		final ISourceViewer viewer = open(factory, "hello\n", items(item(" world")));
+		server(factory).setTimeToProceedQueries(3_000);
+		setCaret(viewer, 5);
+		controller(viewer).trigger();
+		waitForAndAssertCondition(TIMEOUT, () -> requestCount(factory) == 1);
+		controller(viewer).trigger();
+		waitForAndAssertCondition(TIMEOUT, () -> requestCount(factory) == 2);
+		waitForAndAssertCondition(TIMEOUT, () -> factory.cancellations.size() == 1);
+	}
+
+	@Test
+	public void typingFasterThanTheRequestDelaySendsOneRequest(MockLanguageServerFactory factory) throws Exception {
+		final ISourceViewer viewer = open(factory, "x\n", items(item(" world")));
+		store.setValue(InlineCompletionPreferencePage.PREF_DELAY, 500);
+		setCaret(viewer, 1);
+		type(viewer, " we say hello wo");
+		waitForGhost(viewer);
+		assertEquals(1, requestCount(factory));
+	}
+
+	@Test
+	public void closingTheEditorDuringARequestIsHarmless(MockLanguageServerFactory factory) throws Exception {
+		final ISourceViewer viewer = open(factory, "hello\n", items(item(" world")));
+		server(factory).setTimeToProceedQueries(SLOW);
+		setCaret(viewer, 5);
+		final InlineCompletionController controller = controller(viewer);
+		controller.trigger();
+		waitForAndAssertCondition(TIMEOUT, () -> requestCount(factory) == 1);
+		final var errors = new AtomicInteger();
+		final ILogListener listener = (status, plugin) -> {
+			if (status.getSeverity() == IStatus.ERROR) {
+				errors.incrementAndGet();
+			}
+		};
+		Platform.addLogListener(listener);
+		try {
+			final IEditorPart editor = TestUtils.getActiveEditor();
+			TestUtils.closeEditor(editor, false);
+			waitForAndAssertCondition(TIMEOUT, () -> factory.cancellations.size() == 1);
+			// past the time the reply would have arrived
+			processEvents(SLOW + 200);
+			assertEquals(0, errors.get());
+			assertNull(InlineCompletionController.get(viewer));
+		} finally {
+			Platform.removeLogListener(listener);
+		}
+	}
+
+	// ---- other code minings ----------------------------------------------------------------------------
+
+	@Test
+	public void inlayHintAtTheCaretMakesRoomForTheGhost(MockLanguageServerFactory factory) throws Exception {
+		final ISourceViewer viewer = open(factory, "lspt", "hello\n", () -> {
+			final ServerCapabilities capabilities = capabilities();
+			capabilities.setInlayHintProvider(true);
+			return capabilities;
+		}, items(item(" world")));
+		server(factory).getTextDocumentService()
+				.setInlayHints(List.of(new InlayHint(new Position(0, 5), Either.forLeft(": hint"))));
+		final var inlayHints = new InlayHintProvider();
+		assertEquals(1, minings(inlayHints, viewer).size());
+
+		setCaret(viewer, 5);
+		controller(viewer).trigger();
+		waitForGhost(viewer);
+		assertEquals(0, minings(inlayHints, viewer).size(), "the hint at the caret is left out");
+
+		controller(viewer).dismiss();
+		assertEquals(1, minings(inlayHints, viewer).size(), "the hint comes back");
+	}
+
+	@Test
+	public void codeLensOnTheLineTheGhostContinuesAboveIsLeftOut(MockLanguageServerFactory factory) throws Exception {
+		final ISourceViewer viewer = open(factory, "if x:\npass\n", items(item("\n    y()")));
+		server(factory).setCodeLens(List.of(new CodeLens(new Range(new Position(1, 0), new Position(1, 1)),
+				new Command("lens", "dummy"), null)));
+		final var codeLenses = new CodeLensProvider();
+		assertEquals(1, minings(codeLenses, viewer).size());
+
+		setCaret(viewer, 5);
+		controller(viewer).trigger();
+		waitForGhost(viewer);
+		assertEquals(0, minings(codeLenses, viewer).size());
+		controller(viewer).dismiss();
+		assertEquals(1, minings(codeLenses, viewer).size());
+	}
+
+	private static List<? extends ICodeMining> minings(ICodeMiningProvider provider, ISourceViewer viewer)
+			throws Exception {
+		final var future = provider.provideCodeMinings(viewer, new NullProgressMonitor());
+		assertNotNull(future);
+		return future.get(TIMEOUT, TimeUnit.MILLISECONDS);
+	}
+}
