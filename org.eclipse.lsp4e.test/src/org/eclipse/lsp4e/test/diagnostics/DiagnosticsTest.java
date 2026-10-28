@@ -356,7 +356,9 @@ public class DiagnosticsTest extends AbstractTestWithProject {
 			font = new Font(widget.getDisplay(), biggerFont);
 			widget.setFont(font);
 			RGB warningColor = new RGB(244, 200, 45); // from org.eclipse.ui.editors/plugin.xml/extension[@point='org.eclipse.ui.editors.markerAnnotationSpecification']/specification[@annotationType="org.eclipse.ui.workbench.texteditor.warning"]@colorPreferenceValue
-			waitForAndAssertCondition(10_000, widget.getDisplay(), () -> ColorTest.containsColor(widget, warningColor, 10));
+			// macOS converts captured pixels to the display's color profile, which shifts this saturated
+			// color by up to ~25 on wide-gamut displays, while nothing else in the editor comes closer than ~120
+			waitForAndAssertCondition(10_000, widget.getDisplay(), () -> ColorTest.containsColor(widget, warningColor, 40));
 		} finally {
 			if (font != null) {
 				font.dispose();
