@@ -75,28 +75,12 @@ public class DocumentEditAndUndoTest extends AbstractTestWithProject {
 					.isPresent();
 		});
 
-		// perform text editing operation
 		final var display = textWidget.getDisplay();
-		display.asyncExec(new Runnable() {
 
-			@Override
-			public void run() {
-				type(textWidget, 'b');
-				type(textWidget, 'c');
-			}
-
-			private void type(Control control, char c) {
-				control.forceFocus();
-				Event keyEvent= new Event();
-				keyEvent.widget= control;
-				keyEvent.type= SWT.KeyDown;
-				keyEvent.character= c;
-				keyEvent.keyCode= c;
-				display.post(keyEvent);
-				keyEvent.type= SWT.KeyUp;
-				display.post(keyEvent);
-			}
-		});
+		// perform text editing operation (key events are sent to the widget directly
+		// rather than posted to the OS, so the test does not depend on window focus)
+		type(textWidget, 'b');
+		type(textWidget, 'c');
 
 		waitForAndAssertCondition(3_000, () -> {
 			assertEquals("<abc></abc>", doc.get(), "Document content isn't correctly changed");
@@ -111,5 +95,13 @@ public class DocumentEditAndUndoTest extends AbstractTestWithProject {
 			assertEquals(initialContent, doc.get(), "Document content isn't correctly reverted");
 			return true;
 		});
+	}
+
+	private static void type(Control control, char c) {
+		final var keyEvent = new Event();
+		keyEvent.character = c;
+		keyEvent.keyCode = c;
+		control.notifyListeners(SWT.KeyDown, keyEvent);
+		control.notifyListeners(SWT.KeyUp, keyEvent);
 	}
 }
