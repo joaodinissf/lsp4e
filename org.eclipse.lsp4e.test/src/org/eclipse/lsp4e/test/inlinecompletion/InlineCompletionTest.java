@@ -30,6 +30,7 @@ import org.eclipse.jface.bindings.keys.KeySequence;
 import org.eclipse.jface.preference.IPreferenceStore;
 import org.eclipse.jface.text.IDocument;
 import org.eclipse.jface.text.ITextOperationTarget;
+import org.eclipse.jface.text.ITextPresentationListener;
 import org.eclipse.jface.text.ITextViewerExtension2;
 import org.eclipse.jface.text.ITextViewerExtension4;
 import org.eclipse.jface.text.codemining.ICodeMining;
@@ -81,6 +82,7 @@ import org.eclipse.swt.graphics.Color;
 import org.eclipse.swt.graphics.Font;
 import org.eclipse.swt.graphics.FontData;
 import org.eclipse.swt.graphics.GC;
+import org.eclipse.swt.graphics.GlyphMetrics;
 import org.eclipse.swt.graphics.Point;
 import org.eclipse.swt.graphics.TextStyle;
 import org.eclipse.swt.widgets.Display;
@@ -653,7 +655,8 @@ public class InlineCompletionTest extends AbstractTestWithProject {
 	private static void assertHidden(ISourceViewer viewer, int offset, int length, boolean expected) {
 		for (int i = offset; i < offset + length; i++) {
 			final StyleRange style = viewer.getTextWidget().getStyleRangeAtOffset(i);
-			assertEquals(expected, style != null && style.metrics != null && style.metrics.width == 0, "hidden at " + i);
+			assertEquals(expected, style != null && style.metrics != null && style.metrics.width == 0,
+					"hidden at " + i + ", metrics: " + (style == null ? "no style" : style.metrics));
 		}
 	}
 
@@ -704,6 +707,41 @@ public class InlineCompletionTest extends AbstractTestWithProject {
 		((ITextOperationTarget) viewer).doOperation(ITextOperationTarget.UNDO);
 		assertEquals("call(xarg)\nnext\n", viewer.getDocument().get());
 		waitForAndAssertCondition(TIMEOUT, () -> assertHidden(viewer, 6, 4, false));
+	}
+
+	@Test
+	public void movedTextShownAgainByJFaceIsHiddenAgainHoweverLongTheCoveringMiningLasts(
+			MockLanguageServerFactory factory) throws Exception {
+		final ISourceViewer viewer = open(factory, "call(arg)\nnext\n", items(item("x,\n  y, ")));
+		setCaret(viewer, 5);
+		controller(viewer).trigger();
+		waitForAndAssertCondition(TIMEOUT, () -> controller(viewer).isGhostPainted());
+		waitForAndAssertCondition(TIMEOUT, () -> assertHidden(viewer, 5, 4, true));
+		final StyledText widget = viewer.getTextWidget();
+		final var extension = (ITextViewerExtension4) viewer;
+		// a line content mining from before still covers the first moved character, so JFace keeps it wide
+		// through some paints, however hard the controller tries to hide it
+		final ITextPresentationListener covering = presentation -> {
+			final var style = new StyleRange(5, 1, null, null);
+			style.metrics = new GlyphMetrics(0, 0, 20);
+			presentation.mergeStyleRange(style);
+		};
+		extension.addTextPresentationListener(covering);
+		try {
+			for (int i = 0; i < 5; i++) {
+				((ITextViewerExtension2) viewer).invalidateTextPresentation(5, 1);
+				widget.redraw();
+				processEvents(100);
+			}
+			assertEquals(20, widget.getStyleRangeAtOffset(5).metrics.width);
+		} finally {
+			extension.removeTextPresentationListener(covering);
+		}
+		// then the mining is removed and JFace resets the character's style
+		final StyleRange style = widget.getStyleRangeAtOffset(5);
+		style.metrics = null;
+		widget.setStyleRange(style);
+		waitForAndAssertCondition(TIMEOUT, () -> assertHidden(viewer, 5, 4, true));
 	}
 
 	@Test

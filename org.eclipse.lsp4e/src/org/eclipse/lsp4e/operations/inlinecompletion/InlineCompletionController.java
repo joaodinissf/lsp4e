@@ -1173,9 +1173,10 @@ public final class InlineCompletionController {
 			rehiddenFor = current;
 			rehidden = 0;
 		}
-		if (moved != null && rehidden < MAX_REHIDDEN && !isHidden(moved)) {
+		if (moved != null && rehidden < MAX_REHIDDEN && wasReset(moved)) {
 			// JFace resets the style of the character a removed line content mining covered, which can
-			// be moved text: hide it again (a few times at most, should the hiding not take)
+			// be moved text: hide it again (a few times at most, should the hiding not take). Until JFace
+			// removes that mining, it keeps the character wide: waited out, not counted
 			rehidden++;
 			display.asyncExec(() -> {
 				if (!disposed && snapshot == current) {
@@ -1185,22 +1186,25 @@ public final class InlineCompletionController {
 		}
 	}
 
-	/** Returns whether the given model range is drawn without width. */
-	private boolean isHidden(IRegion region) {
+	/**
+	 * Returns whether some of the given model range lost the zero width it is hidden with, rather than having it or
+	 * the width of a line content mining that covers it.
+	 */
+	private boolean wasReset(IRegion region) {
 		final IRegion widgetRange = viewer instanceof ITextViewerExtension5 extension
 				? extension.modelRange2WidgetRange(region)
 				: region;
 		if (widgetRange == null) {
-			return true;
+			return false;
 		}
-		int hiddenUpTo = widgetRange.getOffset();
+		int styledUpTo = widgetRange.getOffset();
 		for (final StyleRange range : textWidget.getStyleRanges(widgetRange.getOffset(), widgetRange.getLength(), true)) {
-			if (range.start > hiddenUpTo || range.metrics == null || range.metrics.width != 0) {
-				return false;
+			if (range.start > styledUpTo || range.metrics == null) {
+				return true;
 			}
-			hiddenUpTo = Math.max(hiddenUpTo, range.start + range.length);
+			styledUpTo = Math.max(styledUpTo, range.start + range.length);
 		}
-		return hiddenUpTo >= widgetRange.getOffset() + widgetRange.getLength();
+		return styledUpTo < widgetRange.getOffset() + widgetRange.getLength();
 	}
 
 	// ---- completion popup ------------------------------------------------------------------------------
