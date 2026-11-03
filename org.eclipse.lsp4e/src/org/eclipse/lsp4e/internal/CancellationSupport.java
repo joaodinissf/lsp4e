@@ -33,7 +33,7 @@ public class CancellationSupport implements CancelChecker {
 
 	private final List<CompletableFuture<?>> futuresToCancel;
 
-	private boolean cancelled;
+	private volatile boolean cancelled;
 
 	public CancellationSupport() {
 		this.futuresToCancel = new ArrayList<>();
@@ -47,7 +47,10 @@ public class CancellationSupport implements CancelChecker {
 			// if null is encountered.
 			LanguageServerPlugin.logError(new NullPointerException("[future] must not be null")); //$NON-NLS-1$
 		} else {
-			this.futuresToCancel.add(future);
+			// requests are often sent from another thread than the one cancelling them
+			synchronized (futuresToCancel) {
+				this.futuresToCancel.add(future);
+			}
 		}
 		return future;
 	}
@@ -56,13 +59,17 @@ public class CancellationSupport implements CancelChecker {
 	 * Cancel all LSP requests.
 	 */
 	public void cancel() {
-		this.cancelled = true;
-		for (CompletableFuture<?> futureToCancel : futuresToCancel) {
+		final List<CompletableFuture<?>> toCancel;
+		synchronized (futuresToCancel) {
+			this.cancelled = true;
+			toCancel = List.copyOf(futuresToCancel);
+			futuresToCancel.clear();
+		}
+		for (CompletableFuture<?> futureToCancel : toCancel) {
 			if (!futureToCancel.isDone()) {
 				futureToCancel.cancel(true);
 			}
 		}
-		futuresToCancel.clear();
 	}
 
 	@Override
