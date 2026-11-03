@@ -161,7 +161,7 @@ public final class InlineCompletionController {
 		/** Edits made at the caret since the request was sent: offset, deleted length, inserted length. */
 		final List<int[]> edits = new ArrayList<>();
 		int remainingResponses;
-		boolean cancelled;
+		volatile boolean cancelled;
 
 		PendingRequest(long id, String text, int caret, InlineCompletionTriggerKind triggerKind,
 				@Nullable SelectedCompletion selected) {
@@ -545,9 +545,15 @@ public final class InlineCompletionController {
 		final var request = new PendingRequest(id, doc.get(), caret, triggerKind, selected);
 		final List<CompletableFuture<@Nullable ServerResponse>> responses = LanguageServers.forDocument(doc)
 				.withCapability(ServerCapabilities::getInlineCompletionProvider)
-				.computeAll((wrapper, server) -> request.cancellation
-						.execute(server.getTextDocumentService().inlineCompletion(params))
-						.handle((response, error) -> new ServerResponse(wrapper, response, error)));
+				.computeAll((wrapper, server) -> {
+					final var response = request.cancellation
+							.execute(server.getTextDocumentService().inlineCompletion(params));
+					if (request.cancelled) {
+						// sent from another thread while it was cancelled, possibly too late for the cancellation
+						response.cancel(true);
+					}
+					return response.handle((result, error) -> new ServerResponse(wrapper, result, error));
+				});
 		if (responses.isEmpty()) {
 			return;
 		}
