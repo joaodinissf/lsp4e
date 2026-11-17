@@ -15,6 +15,7 @@ package org.eclipse.lsp4e.tests.mock;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.function.Function;
 
 import org.eclipse.lsp4j.CreateFilesParams;
@@ -25,6 +26,8 @@ import org.eclipse.lsp4j.DeleteFilesParams;
 import org.eclipse.lsp4j.ExecuteCommandParams;
 import org.eclipse.lsp4j.RenameFilesParams;
 import org.eclipse.lsp4j.SymbolInformation;
+import org.eclipse.lsp4j.WorkspaceDiagnosticParams;
+import org.eclipse.lsp4j.WorkspaceDiagnosticReport;
 import org.eclipse.lsp4j.WorkspaceSymbol;
 import org.eclipse.lsp4j.WorkspaceSymbolParams;
 import org.eclipse.lsp4j.jsonrpc.messages.Either;
@@ -41,6 +44,10 @@ public class MockWorkspaceService implements WorkspaceService {
 	private volatile CreateFilesParams lastWillCreate;
 	private volatile RenameFilesParams lastWillRename;
 	private volatile DeleteFilesParams lastWillDelete;
+
+	private final ConcurrentLinkedQueue<WorkspaceDiagnosticParams> diagnosticRequests = new ConcurrentLinkedQueue<>();
+	private volatile Function<WorkspaceDiagnosticParams, CompletableFuture<WorkspaceDiagnosticReport>> workspaceDiagnostics = params -> CompletableFuture
+			.completedFuture(new WorkspaceDiagnosticReport(List.of()));
 
 	public <U> MockWorkspaceService(Function<U, CompletableFuture<U>> futureFactory) {
 		this._futureFactory = futureFactory;
@@ -127,5 +134,20 @@ public class MockWorkspaceService implements WorkspaceService {
 
 	public DeleteFilesParams getLastWillDelete() {
 		return lastWillDelete;
+	}
+
+	@Override
+	public CompletableFuture<WorkspaceDiagnosticReport> diagnostic(WorkspaceDiagnosticParams params) {
+		diagnosticRequests.add(params);
+		return workspaceDiagnostics.apply(params);
+	}
+
+	public void setWorkspaceDiagnostics(
+			Function<WorkspaceDiagnosticParams, CompletableFuture<WorkspaceDiagnosticReport>> workspaceDiagnostics) {
+		this.workspaceDiagnostics = workspaceDiagnostics;
+	}
+
+	public List<WorkspaceDiagnosticParams> getDiagnosticRequests() {
+		return new ArrayList<>(this.diagnosticRequests);
 	}
 }
