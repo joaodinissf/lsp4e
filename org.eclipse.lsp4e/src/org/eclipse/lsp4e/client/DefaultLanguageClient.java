@@ -32,8 +32,6 @@ import org.eclipse.lsp4e.LSPEclipseUtils;
 import org.eclipse.lsp4e.LanguageServerPlugin;
 import org.eclipse.lsp4e.LanguageServerWrapper;
 import org.eclipse.lsp4e.ServerMessageHandler;
-import org.eclipse.lsp4e.internal.CancellationUtil;
-import org.eclipse.lsp4e.internal.LSPMethods;
 import org.eclipse.lsp4e.operations.diagnostics.PullDiagnosticsReconcilingStrategy;
 import org.eclipse.lsp4e.progress.LSPProgressManager;
 import org.eclipse.lsp4e.ui.Messages;
@@ -41,7 +39,6 @@ import org.eclipse.lsp4e.ui.UI;
 import org.eclipse.lsp4j.ApplyWorkspaceEditParams;
 import org.eclipse.lsp4j.ApplyWorkspaceEditResponse;
 import org.eclipse.lsp4j.ConfigurationParams;
-import org.eclipse.lsp4j.DiagnosticRegistrationOptions;
 import org.eclipse.lsp4j.Location;
 import org.eclipse.lsp4j.MessageActionItem;
 import org.eclipse.lsp4j.MessageParams;
@@ -53,7 +50,6 @@ import org.eclipse.lsp4j.ShowDocumentResult;
 import org.eclipse.lsp4j.ShowMessageRequestParams;
 import org.eclipse.lsp4j.UnregistrationParams;
 import org.eclipse.lsp4j.WorkDoneProgressCreateParams;
-import org.eclipse.lsp4j.WorkspaceDiagnosticParams;
 import org.eclipse.lsp4j.WorkspaceFolder;
 import org.eclipse.lsp4j.services.LanguageClient;
 import org.eclipse.lsp4j.services.LanguageServer;
@@ -205,36 +201,9 @@ public class DefaultLanguageClient implements LanguageClient {
 
 	@Override
 	public CompletableFuture<@Nullable Void> refreshDiagnostics() {
+		// workspace diagnostics need nothing here, as they are pulled again and again while the server runs
 		PullDiagnosticsReconcilingStrategy.refresh(wrapper);
-		wrapper.getRegistrationOptions(null, LSPMethods.TEXT_DOCUMENT_DIAGNOSTIC, DiagnosticRegistrationOptions.class)
-				.stream() //
-				.filter(DiagnosticRegistrationOptions::isWorkspaceDiagnostics) //
-				.map(DiagnosticRegistrationOptions::getIdentifier) //
-				.distinct() //
-				.forEach(this::pullWorkspaceDiagnostics);
-		// the pulls are not awaited, as the server may keep a workspace pull open for long
 		return CompletableFuture.completedFuture(null);
-	}
-
-	private void pullWorkspaceDiagnostics(@Nullable String identifier) {
-		final var params = new WorkspaceDiagnosticParams(List.of());
-		params.setIdentifier(identifier);
-		this.server.getWorkspaceService().diagnostic(params).thenAccept(reports -> {
-			for (final var report : reports.getItems()) {
-				if (report.isLeft()) {
-					final var fullReport = report.getLeft();
-					// documents with pull diagnostics of their own get them from the refresh above
-					if (!wrapper.isConnectedTo(LSPEclipseUtils.toUri(fullReport.getUri()))) {
-						publishDiagnostics(new PublishDiagnosticsParams(fullReport.getUri(), fullReport.getItems()));
-					}
-				}
-			}
-		}).exceptionally(ex -> {
-			if (!CancellationUtil.isRequestCancelledException(ex)) {
-				LanguageServerPlugin.logError(ex);
-			}
-			return null;
-		});
 	}
 
 	/**

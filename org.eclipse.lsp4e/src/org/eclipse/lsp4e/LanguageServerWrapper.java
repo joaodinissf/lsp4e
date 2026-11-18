@@ -87,6 +87,7 @@ import org.eclipse.lsp4e.internal.CancellationUtil;
 import org.eclipse.lsp4e.internal.DynamicRegistrationManager;
 import org.eclipse.lsp4e.internal.FileBufferListenerAdapter;
 import org.eclipse.lsp4e.internal.SupportedFeatures;
+import org.eclipse.lsp4e.internal.WorkspaceDiagnosticsPuller;
 import org.eclipse.lsp4e.internal.files.FileSystemWatcherManager;
 import org.eclipse.lsp4e.logging.LoggingStreamConnectionProviderProxy;
 import org.eclipse.lsp4e.logging.LoggingUtils;
@@ -280,6 +281,7 @@ public class LanguageServerWrapper {
 	 * {@link FileSystemWatcherManager}.
 	 */
 	private final DynamicRegistrationManager registrationManager;
+	private final WorkspaceDiagnosticsPuller workspaceDiagnosticsPuller = new WorkspaceDiagnosticsPuller(this);
 	private final WatchedFilesListener watchedFilesListener = new WatchedFilesListener();
 
 	private static final int LANGUAGE_ID_CACHE_SIZE = 100;
@@ -532,6 +534,7 @@ public class LanguageServerWrapper {
 			}).thenRun(() -> {
 				synchronized (workingContext) {
 					markInitializationProgress(workingContext);
+					workspaceDiagnosticsPuller.start(castNonNull(workingContext.languageServer), castNonNull(languageClient));
 					FileBuffers.getTextFileBufferManager().addFileBufferListener(fileBufferListener);
 					// Register a workspace-level fallback listener to catch resource events for
 					// files not backed by buffers, if enabled for this server
@@ -778,6 +781,7 @@ public class LanguageServerWrapper {
 			this.languageClient.dispose();
 		}
 
+		workspaceDiagnosticsPuller.stop();
 		registrationManager.clear();
 
 		ResourcesPlugin.getWorkspace().removeResourceChangeListener(workspaceFolderUpdater);
@@ -1307,6 +1311,7 @@ public class LanguageServerWrapper {
 	 */
 	private void capabilitiesChanged(final @Nullable ServerCapabilities oldCapabilities,
 			final ServerCapabilities newCapabilities) {
+		workspaceDiagnosticsPuller.update();
 		if (registrationManager.getFileSystemWatcherManager().hasFilePatterns()) {
 			enableWatchedFiles();
 		} else {
