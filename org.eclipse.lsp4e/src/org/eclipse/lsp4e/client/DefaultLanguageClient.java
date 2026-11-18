@@ -201,7 +201,8 @@ public class DefaultLanguageClient implements LanguageClient {
 
 	@Override
 	public CompletableFuture<@Nullable Void> refreshDiagnostics() {
-		// workspace diagnostics need nothing here, as they are pulled again and again while the server runs
+		// workspace diagnostics are pulled again and again anyway, unless the server kept failing
+		wrapper.getWorkspaceDiagnosticsPuller().refresh();
 		PullDiagnosticsReconcilingStrategy.refresh(wrapper);
 		return CompletableFuture.completedFuture(null);
 	}

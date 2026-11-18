@@ -63,6 +63,7 @@ import org.eclipse.lsp4j.WorkspaceUnchangedDocumentDiagnosticReport;
 import org.eclipse.lsp4j.jsonrpc.ResponseErrorException;
 import org.eclipse.lsp4j.jsonrpc.messages.ResponseError;
 import org.eclipse.lsp4j.jsonrpc.messages.ResponseErrorCode;
+import org.eclipse.ui.IEditorPart;
 import org.junit.jupiter.api.Test;
 
 public class PullDiagnosticsTest extends AbstractTestWithProject {
@@ -353,6 +354,76 @@ public class PullDiagnosticsTest extends AbstractTestWithProject {
 		// the first request and five more attempts, two seconds apart
 		waitForAndAssertCondition(20_000, () -> getWorkspaceDiagnosticRequests(factory).size() == 6);
 		assertFalse(waitForCondition(5_000, () -> getWorkspaceDiagnosticRequests(factory).size() > 6));
+
+		// a refresh is taken as a sign that the server recovered
+		factory.getServer().getRemoteProxy().refreshDiagnostics().get(5, TimeUnit.SECONDS);
+		waitForAndAssertCondition(5_000, () -> getWorkspaceDiagnosticRequests(factory).size() > 6);
+	}
+
+	@Test
+	public void testWorkspaceDiagnosticsOfSeveralIdentifiersAreMerged(MockLanguageServerFactory factory)
+			throws Exception {
+		IFile openFile = TestUtils.createUniqueTestFile(project, "");
+		IFile closedFile = TestUtils.createUniqueTestFile(project, "");
+		factory.withConfiguration((idx, server) -> server.getWorkspaceService()
+				.setWorkspaceDiagnostics(params -> CompletableFuture.completedFuture(new WorkspaceDiagnosticReport(List.of( //
+						workspaceReport(closedFile, "from " + params.getIdentifier(), params.getIdentifier()),
+						// a document that is not in the workspace is ignored
+						new WorkspaceDocumentDiagnosticReport(new WorkspaceFullDocumentDiagnosticReport(
+								List.of(diagnostic("nowhere to show")), "file:///not/in/the/workspace.lspt", null)))))));
+		TestUtils.openTextViewer(openFile);
+		IDocument document = LSPEclipseUtils.getDocument(openFile);
+		assertNotNull(document);
+		LanguageServers.forDocument(document).collectAll(ls -> CompletableFuture.completedFuture(ls))
+				.get(5, TimeUnit.SECONDS);
+
+		final var registrations = new ArrayList<Registration>();
+		for (String identifier : List.of("syntax", "semantic")) {
+			final var options = new DiagnosticRegistrationOptions(false, true);
+			options.setIdentifier(identifier);
+			registrations.add(new Registration(identifier, LSPMethods.TEXT_DOCUMENT_DIAGNOSTIC, options));
+		}
+		final var client = factory.getServer().getRemoteProxy();
+		client.registerCapability(new RegistrationParams(registrations)).get(1, TimeUnit.SECONDS);
+		// the reports of all identifiers are published together, rather than replacing each other
+		waitForAndAssertCondition(5_000,
+				() -> getMarkerMessages(closedFile).equals(Set.of("from syntax", "from semantic")));
+
+		// what an identifier reported goes away with its registration
+		client.unregisterCapability(new UnregistrationParams(
+				List.of(new Unregistration("syntax", LSPMethods.TEXT_DOCUMENT_DIAGNOSTIC)))).get(1, TimeUnit.SECONDS);
+		waitForAndAssertCondition(5_000, () -> getMarkerMessages(closedFile).equals(Set.of("from semantic")));
+	}
+
+	@Test
+	public void testWorkspaceDiagnosticsTakeOverWhenEditorCloses(MockLanguageServerFactory factory) throws Exception {
+		IFile otherFile = TestUtils.createUniqueTestFile(project, "");
+		IFile testFile = TestUtils.createUniqueTestFile(project, "");
+		final String testUri = LSPEclipseUtils.toUri(testFile).toString();
+		factory.withCapabilities(() -> withDiagnosticProvider(provider -> provider.setWorkspaceDiagnostics(true)));
+		factory.withConfiguration((idx, server) -> {
+			server.getTextDocumentService().setPullDiagnostics(
+					params -> CompletableFuture.completedFuture(List.of(diagnostic("from document pull"))));
+			// like a server that only reports what the client does not know yet
+			server.getWorkspaceService().setWorkspaceDiagnostics(params -> CompletableFuture
+					.completedFuture(new WorkspaceDiagnosticReport(params.getPreviousResultIds().stream()
+							.anyMatch(previous -> testUri.equals(previous.getUri())) ? List.of()
+									: List.of(workspaceReport(testFile, "from workspace pull", "result")))));
+		});
+
+		// keeps the server running once the editor of the test file is closed
+		TestUtils.openTextViewer(otherFile);
+		waitForAndAssertCondition(5_000, () -> getMarkerMessages(testFile).equals(Set.of("from workspace pull")));
+		waitForAndAssertCondition(5_000, () -> getWorkspaceDiagnosticRequests(factory).stream()
+				.anyMatch(request -> !request.getPreviousResultIds().isEmpty()));
+
+		IEditorPart editor = TestUtils.openEditor(testFile);
+		waitForAndAssertCondition(5_000, () -> getMarkerMessages(testFile).equals(Set.of("from document pull")));
+		// the document pull keeps winning while the document is open
+		assertFalse(waitForCondition(3_000, () -> !getMarkerMessages(testFile).equals(Set.of("from document pull"))));
+
+		TestUtils.closeEditor(editor, false);
+		waitForAndAssertCondition(5_000, () -> getMarkerMessages(testFile).equals(Set.of("from workspace pull")));
 	}
 
 	private static WorkspaceDocumentDiagnosticReport workspaceReport(IFile file, String message, String resultId) {

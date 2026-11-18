@@ -936,6 +936,7 @@ public class LanguageServerWrapper {
 	public @Nullable CompletableFuture<@Nullable Void> disconnect(URI uri) {
 		DocumentContentSynchronizer documentListener = this.connectedDocuments.remove(uri);
 		if (documentListener != null) {
+			workspaceDiagnosticsPuller.forget(uri);
 			documentListener.getDocument().removePrenotifiedDocumentListener(documentListener);
 			documentListener.documentClosed();
 			disconnectTextFileBuffer(uri);
@@ -1765,6 +1766,13 @@ public class LanguageServerWrapper {
 	private boolean isNonBufferedFileListenerEnabled() {
 		IPreferenceStore store = LanguageServerPlugin.getDefault().getPreferenceStore();
 		return store.getBoolean("org.eclipse.lsp4e.resourceFallback.enabled"); //$NON-NLS-1$
+	}
+
+	/**
+	 * @noreference internal
+	 */
+	public WorkspaceDiagnosticsPuller getWorkspaceDiagnosticsPuller() {
+		return workspaceDiagnosticsPuller;
 	}
 
 	public @Nullable LanguageClient getLanguageClient() {

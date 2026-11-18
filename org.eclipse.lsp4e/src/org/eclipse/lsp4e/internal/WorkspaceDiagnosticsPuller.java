@@ -8,7 +8,10 @@
  *******************************************************************************/
 package org.eclipse.lsp4e.internal;
 
+import java.net.URI;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -16,10 +19,12 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+import org.eclipse.core.resources.IResource;
 import org.eclipse.jdt.annotation.Nullable;
 import org.eclipse.lsp4e.LSPEclipseUtils;
 import org.eclipse.lsp4e.LanguageServerPlugin;
 import org.eclipse.lsp4e.LanguageServerWrapper;
+import org.eclipse.lsp4j.Diagnostic;
 import org.eclipse.lsp4j.DiagnosticRegistrationOptions;
 import org.eclipse.lsp4j.PreviousResultId;
 import org.eclipse.lsp4j.PublishDiagnosticsParams;
@@ -35,8 +40,11 @@ import org.eclipse.lsp4j.services.LanguageServer;
  * recommends, {@code workspace/diagnostic} is requested again once answered, after a short delay.
  * <p>
  * Reports for documents connected to the server are dropped, as those get their diagnostics from
- * {@code textDocument/diagnostic}. Their result ids are not kept either, so that the server reports them
- * in full again once they are closed.
+ * {@code textDocument/diagnostic}. Nothing is remembered about them, so that the server reports them in
+ * full again once they are closed. So are reports for documents that are not in the workspace, as there is
+ * nowhere to show them.
+ * <p>
+ * The diagnostics of a document are the union of what each identifier last reported for it.
  */
 public final class WorkspaceDiagnosticsPuller {
 
@@ -79,13 +87,17 @@ public final class WorkspaceDiagnosticsPuller {
 				.filter(DiagnosticRegistrationOptions::isWorkspaceDiagnostics) //
 				.map(DiagnosticRegistrationOptions::getIdentifier) //
 				.collect(Collectors.toSet());
+		final var removed = new ArrayList<Pull>();
 		pulls.entrySet().removeIf(pull -> {
 			if (identifiers.contains(pull.getKey())) {
 				return false;
 			}
 			pull.getValue().stop();
+			removed.add(pull.getValue());
 			return true;
 		});
+		// what the identifiers that are gone reported is not valid anymore
+		removed.forEach(pull -> pull.diagnostics.keySet().forEach(uri -> publish(client, uri)));
 		for (final @Nullable String identifier : identifiers) {
 			if (!pulls.containsKey(identifier)) {
 				final var pull = new Pull(server, client, identifier);
@@ -93,6 +105,31 @@ public final class WorkspaceDiagnosticsPuller {
 				pull.request();
 			}
 		}
+	}
+
+	/** Pulls again the identifiers that were given up on after repeated errors. */
+	public synchronized void refresh() {
+		pulls.values().forEach(Pull::restart);
+	}
+
+	/** Forgets what was reported for the given document, so that the server reports it in full again. */
+	public synchronized void forget(URI uri) {
+		final String key = uri.toString();
+		for (final Pull pull : pulls.values()) {
+			pull.resultIds.remove(key);
+			pull.diagnostics.remove(key);
+		}
+	}
+
+	private synchronized void publish(LanguageClient client, String uri) {
+		if (wrapper.isConnectedTo(LSPEclipseUtils.toUri(uri))) {
+			return;
+		}
+		final var diagnostics = new ArrayList<Diagnostic>();
+		for (final Pull pull : pulls.values()) {
+			diagnostics.addAll(pull.diagnostics.getOrDefault(uri, List.of()));
+		}
+		client.publishDiagnostics(new PublishDiagnosticsParams(uri, diagnostics));
 	}
 
 	public synchronized void stop() {
@@ -108,9 +145,12 @@ public final class WorkspaceDiagnosticsPuller {
 		private final @Nullable String identifier;
 		/** The result id of the last report by document URI, as sent by the server. */
 		private final Map<String, String> resultIds = new ConcurrentHashMap<>();
+		/** The diagnostics last published by document URI, as sent by the server. */
+		private final Map<String, List<Diagnostic>> diagnostics = new ConcurrentHashMap<>();
 		private volatile boolean stopped;
+		private volatile boolean gaveUp;
 		private volatile @Nullable CompletableFuture<WorkspaceDiagnosticReport> pending;
-		private int consecutiveErrors;
+		private volatile int consecutiveErrors;
 
 		Pull(LanguageServer server, LanguageClient client, @Nullable String identifier) {
 			this.server = server;
@@ -157,34 +197,45 @@ public final class WorkspaceDiagnosticsPuller {
 			} else if (!CancellationUtil.isRequestCancelledException(ex)) {
 				LanguageServerPlugin.logError(ex);
 				if (++consecutiveErrors > MAX_CONSECUTIVE_ERRORS) {
+					gaveUp = true;
 					return;
 				}
 			}
 			CompletableFuture.delayedExecutor(DELAY_BETWEEN_PULLS_MS, TimeUnit.MILLISECONDS).execute(this::request);
 		}
 
+		void restart() {
+			if (gaveUp) {
+				gaveUp = false;
+				consecutiveErrors = 0;
+				request();
+			}
+		}
+
 		private void accept(WorkspaceDocumentDiagnosticReport report) {
-			if (report.isWorkspaceUnchangedDocumentDiagnosticReport()) {
-				final var unchanged = report.getWorkspaceUnchangedDocumentDiagnosticReport();
-				if (wrapper.isConnectedTo(LSPEclipseUtils.toUri(unchanged.getUri()))) {
-					resultIds.remove(unchanged.getUri());
-				} else {
-					resultIds.put(unchanged.getUri(), unchanged.getResultId());
-				}
+			final boolean isFull = report.isWorkspaceFullDocumentDiagnosticReport();
+			final String uri = isFull ? report.getWorkspaceFullDocumentDiagnosticReport().getUri()
+					: report.getWorkspaceUnchangedDocumentDiagnosticReport().getUri();
+			final String resultId = isFull ? report.getWorkspaceFullDocumentDiagnosticReport().getResultId()
+					: report.getWorkspaceUnchangedDocumentDiagnosticReport().getResultId();
+			if (wrapper.isConnectedTo(LSPEclipseUtils.toUri(uri))) {
 				return;
 			}
-			final var full = report.getWorkspaceFullDocumentDiagnosticReport();
-			final String uri = full.getUri();
-			final String resultId = full.getResultId();
-			if (wrapper.isConnectedTo(LSPEclipseUtils.toUri(uri))) {
-				resultIds.remove(uri);
+			if (resultId != null) {
+				resultIds.put(uri, resultId);
 			} else {
-				if (resultId != null) {
-					resultIds.put(uri, resultId);
-				} else {
-					resultIds.remove(uri);
-				}
-				client.publishDiagnostics(new PublishDiagnosticsParams(uri, full.getItems()));
+				resultIds.remove(uri);
+			}
+			if (!isFull) {
+				return;
+			}
+			final IResource resource = LSPEclipseUtils.findResourceFor(uri);
+			if (resource == null || !resource.isAccessible()) {
+				return;
+			}
+			final List<Diagnostic> items = report.getWorkspaceFullDocumentDiagnosticReport().getItems();
+			if (!items.equals(diagnostics.put(uri, items))) {
+				publish(client, uri);
 			}
 		}
 
