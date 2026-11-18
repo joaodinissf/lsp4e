@@ -48,6 +48,7 @@ import org.eclipse.lsp4j.DocumentDiagnosticParams;
 import org.eclipse.lsp4j.DocumentFilter;
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.PreviousResultId;
+import org.eclipse.lsp4j.ProgressParams;
 import org.eclipse.lsp4j.Range;
 import org.eclipse.lsp4j.Registration;
 import org.eclipse.lsp4j.RegistrationParams;
@@ -57,10 +58,12 @@ import org.eclipse.lsp4j.Unregistration;
 import org.eclipse.lsp4j.UnregistrationParams;
 import org.eclipse.lsp4j.WorkspaceDiagnosticParams;
 import org.eclipse.lsp4j.WorkspaceDiagnosticReport;
+import org.eclipse.lsp4j.WorkspaceDiagnosticReportPartialResult;
 import org.eclipse.lsp4j.WorkspaceDocumentDiagnosticReport;
 import org.eclipse.lsp4j.WorkspaceFullDocumentDiagnosticReport;
 import org.eclipse.lsp4j.WorkspaceUnchangedDocumentDiagnosticReport;
 import org.eclipse.lsp4j.jsonrpc.ResponseErrorException;
+import org.eclipse.lsp4j.jsonrpc.messages.Either;
 import org.eclipse.lsp4j.jsonrpc.messages.ResponseError;
 import org.eclipse.lsp4j.jsonrpc.messages.ResponseErrorCode;
 import org.eclipse.ui.IEditorPart;
@@ -424,6 +427,37 @@ public class PullDiagnosticsTest extends AbstractTestWithProject {
 
 		TestUtils.closeEditor(editor, false);
 		waitForAndAssertCondition(5_000, () -> getMarkerMessages(testFile).equals(Set.of("from workspace pull")));
+	}
+
+	@Test
+	public void testPartialWorkspaceDiagnosticResults(MockLanguageServerFactory factory) throws Exception {
+		IFile openFile = TestUtils.createUniqueTestFile(project, "");
+		IFile closedFile = TestUtils.createUniqueTestFile(project, "");
+		final String closedUri = LSPEclipseUtils.toUri(closedFile).toString();
+		final var request = new CompletableFuture<WorkspaceDiagnosticReport>();
+		factory.withCapabilities(() -> withDiagnosticProvider(provider -> provider.setWorkspaceDiagnostics(true)));
+		// like a server that keeps the request open and reports through partial results
+		factory.withConfiguration(
+				(idx, server) -> server.getWorkspaceService().setWorkspaceDiagnostics(params -> request));
+
+		TestUtils.openTextViewer(openFile);
+		waitForAndAssertCondition(5_000, () -> !getWorkspaceDiagnosticRequests(factory).isEmpty());
+		final var token = getWorkspaceDiagnosticRequests(factory).get(0).getPartialResultToken();
+		assertNotNull(token);
+
+		final var client = factory.getServer().getRemoteProxy();
+		for (String message : List.of("partial 1", "partial 2")) {
+			client.notifyProgress(new ProgressParams(token, Either.forRight(new WorkspaceDiagnosticReportPartialResult(
+					List.of(workspaceReport(closedFile, message, "result " + message))))));
+			waitForAndAssertCondition(5_000, () -> getMarkerMessages(closedFile).equals(Set.of(message)));
+		}
+
+		// the server is asked again once it completes the request, with what the partial results told
+		request.complete(new WorkspaceDiagnosticReport(List.of()));
+		waitForAndAssertCondition(5_000, () -> getWorkspaceDiagnosticRequests(factory).size() == 2);
+		assertEquals(List.of(new PreviousResultId(closedUri, "result partial 2")),
+				getWorkspaceDiagnosticRequests(factory).get(1).getPreviousResultIds());
+		assertEquals(Set.of("partial 2"), getMarkerMessages(closedFile));
 	}
 
 	private static WorkspaceDocumentDiagnosticReport workspaceReport(IFile file, String message, String resultId) {

@@ -14,6 +14,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -27,9 +28,11 @@ import org.eclipse.lsp4e.LanguageServerWrapper;
 import org.eclipse.lsp4j.Diagnostic;
 import org.eclipse.lsp4j.DiagnosticRegistrationOptions;
 import org.eclipse.lsp4j.PreviousResultId;
+import org.eclipse.lsp4j.ProgressParams;
 import org.eclipse.lsp4j.PublishDiagnosticsParams;
 import org.eclipse.lsp4j.WorkspaceDiagnosticParams;
 import org.eclipse.lsp4j.WorkspaceDiagnosticReport;
+import org.eclipse.lsp4j.WorkspaceDiagnosticReportPartialResult;
 import org.eclipse.lsp4j.WorkspaceDocumentDiagnosticReport;
 import org.eclipse.lsp4j.services.LanguageClient;
 import org.eclipse.lsp4j.services.LanguageServer;
@@ -44,11 +47,15 @@ import org.eclipse.lsp4j.services.LanguageServer;
  * full again once they are closed. So are reports for documents that are not in the workspace, as there is
  * nowhere to show them.
  * <p>
+ * A server may answer a request little by little with partial results, and only complete it when it wants
+ * to be asked again. Those are handled like complete answers.
+ * <p>
  * The diagnostics of a document are the union of what each identifier last reported for it.
  */
 public final class WorkspaceDiagnosticsPuller {
 
 	private static final long DELAY_BETWEEN_PULLS_MS = 2000;
+	private static final String PARTIAL_RESULT_TOKEN_PREFIX = "lsp4e-workspace-diagnostics-"; //$NON-NLS-1$
 	/** The number of consecutive failed requests after which an identifier is not pulled anymore. */
 	private static final int MAX_CONSECUTIVE_ERRORS = 5;
 
@@ -112,6 +119,29 @@ public final class WorkspaceDiagnosticsPuller {
 		pulls.values().forEach(Pull::restart);
 	}
 
+	/**
+	 * Handles the given progress if it is a partial result of one of the requests sent from here.
+	 *
+	 * @return whether the progress was handled
+	 */
+	public boolean notifyProgress(ProgressParams params) {
+		final var token = params.getToken();
+		final var value = params.getValue();
+		if (!token.isLeft() || !token.getLeft().startsWith(PARTIAL_RESULT_TOKEN_PREFIX) || !value.isRight()) {
+			return false;
+		}
+		final Pull pull;
+		synchronized (this) {
+			pull = pulls.values().stream().filter(p -> token.getLeft().equals(p.partialResultToken)).findAny()
+					.orElse(null);
+		}
+		if (pull != null) {
+			pull.partialResult(value.getRight());
+		}
+		// a partial result that comes too late is of no interest to anyone else either
+		return true;
+	}
+
 	/** Forgets what was reported for the given document, so that the server reports it in full again. */
 	public synchronized void forget(URI uri) {
 		final String key = uri.toString();
@@ -151,6 +181,8 @@ public final class WorkspaceDiagnosticsPuller {
 		private volatile boolean gaveUp;
 		private volatile @Nullable CompletableFuture<WorkspaceDiagnosticReport> pending;
 		private volatile int consecutiveErrors;
+		/** The token of the last request, with which the server may send partial results. */
+		private volatile @Nullable String partialResultToken;
 
 		Pull(LanguageServer server, LanguageClient client, @Nullable String identifier) {
 			this.server = server;
@@ -167,6 +199,9 @@ public final class WorkspaceDiagnosticsPuller {
 					.filter(resultId -> !wrapper.isConnectedTo(LSPEclipseUtils.toUri(resultId.getKey())))
 					.map(resultId -> new PreviousResultId(resultId.getKey(), resultId.getValue())).toList());
 			params.setIdentifier(identifier);
+			final String token = PARTIAL_RESULT_TOKEN_PREFIX + UUID.randomUUID();
+			partialResultToken = token;
+			params.setPartialResultToken(token);
 			final CompletableFuture<WorkspaceDiagnosticReport> request;
 			try {
 				request = server.getWorkspaceService().diagnostic(params);
@@ -202,6 +237,22 @@ public final class WorkspaceDiagnosticsPuller {
 				}
 			}
 			CompletableFuture.delayedExecutor(DELAY_BETWEEN_PULLS_MS, TimeUnit.MILLISECONDS).execute(this::request);
+		}
+
+		void partialResult(Object value) {
+			if (stopped) {
+				return;
+			}
+			try {
+				final var gson = JsonUtil.LSP4J_GSON;
+				final var result = value instanceof WorkspaceDiagnosticReportPartialResult partialResult ? partialResult
+						: gson.fromJson(gson.toJsonTree(value), WorkspaceDiagnosticReportPartialResult.class);
+				if (result != null && result.getItems() != null) {
+					result.getItems().forEach(this::accept);
+				}
+			} catch (RuntimeException e) {
+				LanguageServerPlugin.logError(e);
+			}
 		}
 
 		void restart() {
