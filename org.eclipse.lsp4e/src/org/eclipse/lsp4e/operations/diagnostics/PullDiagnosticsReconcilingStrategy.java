@@ -12,6 +12,7 @@
 package org.eclipse.lsp4e.operations.diagnostics;
 
 import java.net.URI;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -21,7 +22,6 @@ import java.util.Set;
 import java.util.WeakHashMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 import org.eclipse.jdt.annotation.Nullable;
@@ -40,20 +40,44 @@ import org.eclipse.lsp4e.internal.LSPMethods;
 import org.eclipse.lsp4j.Diagnostic;
 import org.eclipse.lsp4j.DiagnosticRegistrationOptions;
 import org.eclipse.lsp4j.DocumentDiagnosticParams;
+import org.eclipse.lsp4j.DocumentDiagnosticReport;
 import org.eclipse.lsp4j.PublishDiagnosticsParams;
 import org.eclipse.lsp4j.TextDocumentIdentifier;
 import org.eclipse.lsp4j.services.LanguageServer;
 
 public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy, ITextViewerLifecycle {
 
+	/** The last full report of an identifier, with the result id of the last report if the server sent one. */
+	private record Report(@Nullable String resultId, List<Diagnostic> items) {
+	}
+
 	/**
-	 * A document with the last full report per server and identifier, reused while the request for an
-	 * identifier fails. Replaced as a whole on {@link #setDocument(IDocument)}, so responses to requests for
-	 * a previous document cannot leak into the cache of the current one. The cache is guarded by its own
-	 * monitor.
+	 * What was pulled from a server for a document, for as long as the server is not started again. Guarded
+	 * by the monitor of the map it is in.
 	 */
-	private record DocumentState(@Nullable IDocument document,
-			Map<LanguageServerWrapper, Map<@Nullable String, List<Diagnostic>>> lastDiagnostics) {
+	private static final class ServerState {
+		final LanguageServer server;
+		/**
+		 * The last reports by identifier, which stay while the request for an identifier fails or is answered
+		 * with nothing having changed.
+		 */
+		final Map<@Nullable String, Report> reports = new HashMap<>();
+		/** The number of pulls so far, of which only the answer to the last one counts. */
+		int pulls;
+		/** The requests of the last pull, until it is answered. */
+		List<CompletableFuture<?>> pending = List.of();
+
+		ServerState(LanguageServer server) {
+			this.server = server;
+		}
+	}
+
+	/**
+	 * A document with what was pulled for it from each server. Replaced as a whole on
+	 * {@link #setDocument(IDocument)}, so responses to requests for a previous document cannot leak into
+	 * what is known of the current one. The map is guarded by its own monitor.
+	 */
+	private record DocumentState(@Nullable IDocument document, Map<LanguageServerWrapper, ServerState> servers) {
 	}
 
 	/** The strategies in use, held weakly as not every owner announces the end of a strategy's life. */
@@ -120,11 +144,12 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 		if (uri == null) {
 			return;
 		}
+		removeDiagnosticsOfUnregistered(currentState, uri);
 		if (onlyServer != null) {
 			// not by way of all servers of the document, which starts those that do not run, and only if
 			// this is a document of the server at all
 			if (onlyServer.isActive() && onlyServer.isConnectedTo(uri) && !getIdentifiers(onlyServer, uri).isEmpty()) {
-				onlyServer.execute(ls -> pullDiagnostics(onlyServer, ls, id, uri, currentState.lastDiagnostics()));
+				onlyServer.execute(ls -> pullDiagnostics(currentState, onlyServer, ls, id, uri));
 			}
 			return;
 		}
@@ -132,7 +157,33 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 		// so servers whose diagnostic registrations' documentSelectors don't match are skipped
 		LanguageServers.forDocument(doc) //
 				.withFilter(capabilities -> capabilities.getDiagnosticProvider() != null) //
-				.collectAll((wrapper, ls) -> pullDiagnostics(wrapper, ls, id, uri, currentState.lastDiagnostics()));
+				.collectAll((wrapper, ls) -> pullDiagnostics(currentState, wrapper, ls, id, uri));
+	}
+
+	/**
+	 * Removes the diagnostics of the servers that do not register any identifier for the document anymore,
+	 * as those are not pulled from anymore.
+	 */
+	private static void removeDiagnosticsOfUnregistered(DocumentState state, URI uri) {
+		final List<LanguageServerWrapper> wrappers;
+		synchronized (state.servers()) {
+			wrappers = List.copyOf(state.servers().keySet());
+		}
+		for (final LanguageServerWrapper wrapper : wrappers) {
+			// not those of a server that was stopped, which registers nothing either
+			if (!wrapper.isActive() || !getIdentifiers(wrapper, uri).isEmpty()) {
+				continue;
+			}
+			final ServerState server;
+			synchronized (state.servers()) {
+				server = state.servers().remove(wrapper);
+			}
+			final var client = wrapper.getLanguageClient();
+			if (server != null && client != null) {
+				server.pending.forEach(request -> request.cancel(true));
+				client.publishDiagnostics(new PublishDiagnosticsParams(uri.toString(), List.of()));
+			}
+		}
 	}
 
 	/**
@@ -140,39 +191,92 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 	 * them together, as each publication replaces the server's previous diagnostics for the document.
 	 * An identifier whose request fails contributes its last full report, so that neither the other
 	 * identifiers' new diagnostics nor its own previous ones are lost.
+	 * <p>
+	 * The requests of the pull before are cancelled if they are not answered yet, and their answers are
+	 * ignored. So the answer that nothing changed always is about the last report.
 	 */
-	private static CompletableFuture<@Nullable Void> pullDiagnostics(LanguageServerWrapper wrapper, LanguageServer ls,
-			TextDocumentIdentifier id, URI uri,
-			Map<LanguageServerWrapper, Map<@Nullable String, List<Diagnostic>>> lastDiagnostics) {
-		final var requests = new HashMap<@Nullable String, CompletableFuture<Optional<List<Diagnostic>>>>();
+	private static CompletableFuture<@Nullable Void> pullDiagnostics(DocumentState state,
+			LanguageServerWrapper wrapper, LanguageServer ls, TextDocumentIdentifier id, URI uri) {
+		final var previousResultIds = new HashMap<@Nullable String, String>();
+		final ServerState server;
+		final int pull;
+		final List<CompletableFuture<?>> overtaken;
+		synchronized (state.servers()) {
+			// a server that was started again knows nothing about the result ids of the one before
+			server = state.servers().compute(wrapper,
+					(w, last) -> last != null && last.server == ls ? last : new ServerState(ls));
+			pull = ++server.pulls;
+			overtaken = server.pending;
+			server.pending = List.of();
+			server.reports.forEach((identifier, report) -> {
+				final String resultId = report.resultId();
+				if (resultId != null) {
+					previousResultIds.put(identifier, resultId);
+				}
+			});
+		}
+		// outside of the monitor, as it tells the server
+		overtaken.forEach(request -> request.cancel(true));
+		final var requests = new HashMap<@Nullable String, CompletableFuture<Optional<DocumentDiagnosticReport>>>();
+		final var sent = new ArrayList<CompletableFuture<?>>();
 		for (final String identifier : getIdentifiers(wrapper, uri)) {
 			final var param = new DocumentDiagnosticParams(id);
 			param.setIdentifier(identifier);
-			requests.put(identifier, ls.getTextDocumentService().diagnostic(param) //
-					.thenApply(report -> report.map(d -> Optional.of(d.getItems()),
-							r -> Optional.<List<Diagnostic>>empty()))
-					.exceptionally(ex -> {
-						if (!CancellationUtil.isRequestCancelledException(ex)) {
-							LanguageServerPlugin.logError(ex);
-						}
-						return Optional.empty();
-					}));
+			// lets the server answer that nothing changed instead of sending the same diagnostics again
+			final String previousResultId = previousResultIds.get(identifier);
+			if (previousResultId != null) {
+				param.setPreviousResultId(previousResultId);
+			}
+			final var request = ls.getTextDocumentService().diagnostic(param);
+			sent.add(request);
+			requests.put(identifier, request.thenApply(Optional::ofNullable).exceptionally(ex -> {
+				if (!CancellationUtil.isRequestCancelledException(ex)) {
+					LanguageServerPlugin.logError(ex);
+				}
+				return Optional.empty();
+			}));
+		}
+		final boolean overtakenAlready;
+		synchronized (state.servers()) {
+			overtakenAlready = server.pulls != pull;
+			if (!overtakenAlready) {
+				server.pending = sent;
+			}
+		}
+		if (overtakenAlready) {
+			sent.forEach(request -> request.cancel(true));
 		}
 		return CompletableFuture.allOf(requests.values().toArray(CompletableFuture[]::new)).thenRun(() -> {
-			synchronized (lastDiagnostics) {
-				final Map<@Nullable String, List<Diagnostic>> last = lastDiagnostics.computeIfAbsent(wrapper,
-						w -> new HashMap<>());
-				last.keySet().retainAll(requests.keySet());
-				AtomicBoolean hasFullReport = new AtomicBoolean();
+			synchronized (state.servers()) {
+				if (state.servers().get(wrapper) != server || server.pulls != pull) {
+					// the server was started or asked again since
+					return;
+				}
+				server.pending = List.of();
+				final Map<@Nullable String, Report> last = server.reports;
+				// the diagnostics of an identifier that the server does not register anymore are gone
+				boolean changed = last.keySet().retainAll(requests.keySet());
 				for (final var request : requests.entrySet()) {
-					request.getValue().join().ifPresent(item -> {
-						hasFullReport.set(true);
-						last.put(request.getKey(), item);
-					});
+					final @Nullable String identifier = request.getKey();
+					final DocumentDiagnosticReport report = request.getValue().join().orElse(null);
+					if (report == null) {
+						continue;
+					}
+					if (report.isLeft()) {
+						changed = true;
+						final List<Diagnostic> items = report.getLeft().getItems();
+						last.put(identifier, new Report(report.getLeft().getResultId(), items == null ? List.of() : items));
+					} else {
+						final Report previous = last.get(identifier);
+						if (previous != null) {
+							// nothing changed, only the result id to send next time may have
+							last.put(identifier, new Report(report.getRight().getResultId(), previous.items()));
+						}
+					}
 				}
 				final var client = wrapper.getLanguageClient();
-				if (hasFullReport.get() && client != null) {
-					final var diagnostics = last.values().stream().flatMap(List::stream).toList();
+				if (changed && client != null) {
+					final var diagnostics = last.values().stream().flatMap(report -> report.items().stream()).toList();
 					client.publishDiagnostics(new PublishDiagnosticsParams(uri.toString(), diagnostics));
 				}
 			}

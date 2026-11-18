@@ -20,10 +20,12 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 import org.eclipse.core.resources.IFile;
@@ -45,13 +47,18 @@ import org.eclipse.lsp4j.Diagnostic;
 import org.eclipse.lsp4j.DiagnosticRegistrationOptions;
 import org.eclipse.lsp4j.DiagnosticServerCapabilities;
 import org.eclipse.lsp4j.DocumentDiagnosticParams;
+import org.eclipse.lsp4j.DocumentDiagnosticReport;
 import org.eclipse.lsp4j.DocumentFilter;
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.Range;
 import org.eclipse.lsp4j.Registration;
 import org.eclipse.lsp4j.RegistrationParams;
+import org.eclipse.lsp4j.RelatedFullDocumentDiagnosticReport;
+import org.eclipse.lsp4j.RelatedUnchangedDocumentDiagnosticReport;
 import org.eclipse.lsp4j.ServerCapabilities;
 import org.eclipse.lsp4j.TextDocumentServerCapabilities;
+import org.eclipse.lsp4j.Unregistration;
+import org.eclipse.lsp4j.UnregistrationParams;
 import org.eclipse.lsp4j.WorkspaceDiagnosticParams;
 import org.eclipse.lsp4j.WorkspaceDiagnosticReport;
 import org.eclipse.lsp4j.WorkspaceDocumentDiagnosticReport;
@@ -265,6 +272,101 @@ public class PullDiagnosticsTest extends AbstractTestWithProject {
 	private static WorkspaceDocumentDiagnosticReport workspaceReport(IFile file, String message) {
 		return new WorkspaceDocumentDiagnosticReport(new WorkspaceFullDocumentDiagnosticReport(
 				List.of(diagnostic(message)), LSPEclipseUtils.toUri(file).toString(), null));
+	}
+
+	@Test
+	public void testPreviousResultIdIsSentAndUnchangedReportKeepsDiagnostics(MockLanguageServerFactory factory)
+			throws Exception {
+		factory.withCapabilities(() -> withDiagnosticProvider(provider -> {}));
+		factory.withConfiguration((idx, server) -> server.getTextDocumentService().setPullDiagnosticReports(params -> {
+			if (params.getPreviousResultId() == null) {
+				final var full = new RelatedFullDocumentDiagnosticReport(List.of(diagnostic("from full report")));
+				full.setResultId("result 1");
+				return CompletableFuture.completedFuture(new DocumentDiagnosticReport(full));
+			}
+			return CompletableFuture.completedFuture(
+					new DocumentDiagnosticReport(new RelatedUnchangedDocumentDiagnosticReport("result 2")));
+		}));
+
+		IFile testFile = TestUtils.createUniqueTestFile(project, "");
+		ITextViewer viewer = TestUtils.openTextViewer(testFile);
+		waitForAndAssertCondition(5_000, () -> getMarkerMessages(testFile).equals(Set.of("from full report")));
+		assertEquals(null, getDiagnosticRequests(factory).get(0).getPreviousResultId());
+
+		viewer.getDocument().replace(0, 0, "a");
+		waitForAndAssertCondition(5_000, () -> getDiagnosticRequests(factory).stream()
+				.anyMatch(request -> "result 1".equals(request.getPreviousResultId())));
+		// the result id of an unchanged report replaces the one of the full report
+		viewer.getDocument().replace(0, 0, "b");
+		waitForAndAssertCondition(5_000, () -> getDiagnosticRequests(factory).stream()
+				.anyMatch(request -> "result 2".equals(request.getPreviousResultId())));
+		assertEquals(Set.of("from full report"), getMarkerMessages(testFile));
+	}
+
+	@Test
+	public void testPullThatIsOvertakenByLaterPullIsCancelled(MockLanguageServerFactory factory) throws Exception {
+		final var slowAnswers = new CopyOnWriteArrayList<CompletableFuture<DocumentDiagnosticReport>>();
+		final var answer = new AtomicReference<Supplier<CompletableFuture<DocumentDiagnosticReport>>>(
+				() -> CompletableFuture.completedFuture(fullReport("first", "result 1")));
+		factory.withCapabilities(() -> withDiagnosticProvider(provider -> {}));
+		factory.withConfiguration(
+				(idx, server) -> server.getTextDocumentService().setPullDiagnosticReports(params -> answer.get().get()));
+
+		IFile testFile = TestUtils.createUniqueTestFile(project, "");
+		ITextViewer viewer = TestUtils.openTextViewer(testFile);
+		waitForAndAssertCondition(5_000, () -> getMarkerMessages(testFile).equals(Set.of("first")));
+
+		answer.set(() -> {
+			final var slowAnswer = new CompletableFuture<DocumentDiagnosticReport>();
+			slowAnswers.add(slowAnswer);
+			return slowAnswer;
+		});
+		viewer.getDocument().replace(0, 0, "a");
+		waitForAndAssertCondition(5_000, () -> !slowAnswers.isEmpty());
+		answer.set(() -> CompletableFuture.completedFuture(fullReport("third", "result 3")));
+		viewer.getDocument().replace(0, 0, "b");
+		waitForAndAssertCondition(5_000, () -> getMarkerMessages(testFile).equals(Set.of("third")));
+
+		// an answer to it would be about the first report, not the third
+		waitForAndAssertCondition(5_000, () -> slowAnswers.stream().allMatch(CompletableFuture::isCancelled));
+		viewer.getDocument().replace(0, 0, "c");
+		waitForAndAssertCondition(5_000, () -> "result 3".equals(
+				getDiagnosticRequests(factory).get(getDiagnosticRequests(factory).size() - 1).getPreviousResultId()));
+		assertEquals(Set.of("third"), getMarkerMessages(testFile));
+	}
+
+	@Test
+	public void testDiagnosticsOfUnregisteredIdentifierAreRemoved(MockLanguageServerFactory factory) throws Exception {
+		factory.withConfiguration((idx, server) -> server.getTextDocumentService().setPullDiagnosticReports(params -> {
+			if (params.getPreviousResultId() != null) {
+				return CompletableFuture.completedFuture(new DocumentDiagnosticReport(
+						new RelatedUnchangedDocumentDiagnosticReport(params.getPreviousResultId())));
+			}
+			return CompletableFuture
+					.completedFuture(fullReport("from " + params.getIdentifier(), "result " + params.getIdentifier()));
+		}));
+
+		IFile testFile = TestUtils.createUniqueTestFile(project, "");
+		ITextViewer viewer = TestUtils.openTextViewer(testFile);
+		registerSyntaxAndSemanticDiagnostics(factory, testFile);
+		viewer.getDocument().replace(0, 0, "a");
+		waitForAndAssertCondition(5_000, () -> getMarkerMessages(testFile).equals(Set.of("from syntax", "from semantic")));
+
+		factory.getServer().getRemoteProxy().unregisterCapability(new UnregistrationParams(
+				List.of(new Unregistration("semantic", LSPMethods.TEXT_DOCUMENT_DIAGNOSTIC)))).get(1, TimeUnit.SECONDS);
+		// without an edit, and although the answer for the identifier that is left is that nothing changed
+		waitForAndAssertCondition(5_000, () -> getMarkerMessages(testFile).equals(Set.of("from syntax")));
+
+		factory.getServer().getRemoteProxy().unregisterCapability(new UnregistrationParams(
+				List.of(new Unregistration("syntax", LSPMethods.TEXT_DOCUMENT_DIAGNOSTIC)))).get(1, TimeUnit.SECONDS);
+		// although there is nothing left to pull from the server
+		waitForAndAssertCondition(5_000, () -> getMarkerMessages(testFile).equals(Set.of()));
+	}
+
+	private static DocumentDiagnosticReport fullReport(String message, String resultId) {
+		final var full = new RelatedFullDocumentDiagnosticReport(List.of(diagnostic(message)));
+		full.setResultId(resultId);
+		return new DocumentDiagnosticReport(full);
 	}
 
 	private static ResponseErrorException serverCancelled() {

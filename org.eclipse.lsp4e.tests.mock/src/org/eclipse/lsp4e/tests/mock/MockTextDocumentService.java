@@ -124,6 +124,8 @@ public class MockTextDocumentService implements TextDocumentService {
 	private Function<DocumentDiagnosticParams, CompletableFuture<List<Diagnostic>>> pullDiagnostics = params -> CompletableFuture
 			.completedFuture(Collections.emptyList());
 
+	private Function<DocumentDiagnosticParams, CompletableFuture<DocumentDiagnosticReport>> pullDiagnosticReports;
+
 	private Function<?, ? extends CompletableFuture<?>> _futureFactory;
 	/**
 	 * The remote proxy. This can be used to send requests to the client.
@@ -325,6 +327,9 @@ public class MockTextDocumentService implements TextDocumentService {
 	@Override
 	public CompletableFuture<DocumentDiagnosticReport> diagnostic(DocumentDiagnosticParams params) {
 		this.diagnosticRequests.add(params);
+		if (pullDiagnosticReports != null) {
+			return pullDiagnosticReports.apply(params);
+		}
 		return pullDiagnostics.apply(params)
 				.thenApply(items -> new DocumentDiagnosticReport(new RelatedFullDocumentDiagnosticReport(items)));
 	}
@@ -332,6 +337,14 @@ public class MockTextDocumentService implements TextDocumentService {
 	public void setPullDiagnostics(
 			Function<DocumentDiagnosticParams, CompletableFuture<List<Diagnostic>>> pullDiagnostics) {
 		this.pullDiagnostics = pullDiagnostics;
+	}
+
+	/**
+	 * Like {@link #setPullDiagnostics(Function)}, for reports that are not just a list of diagnostics.
+	 */
+	public void setPullDiagnosticReports(
+			Function<DocumentDiagnosticParams, CompletableFuture<DocumentDiagnosticReport>> pullDiagnosticReports) {
+		this.pullDiagnosticReports = pullDiagnosticReports;
 	}
 
 	public List<DocumentDiagnosticParams> getDiagnosticRequests() {

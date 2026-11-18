@@ -19,6 +19,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
+import java.util.stream.Stream;
 
 import org.eclipse.core.runtime.Adapters;
 import org.eclipse.core.runtime.IProgressMonitor;
@@ -48,10 +49,12 @@ import org.eclipse.lsp4j.MessageActionItem;
 import org.eclipse.lsp4j.MessageParams;
 import org.eclipse.lsp4j.ProgressParams;
 import org.eclipse.lsp4j.PublishDiagnosticsParams;
+import org.eclipse.lsp4j.Registration;
 import org.eclipse.lsp4j.RegistrationParams;
 import org.eclipse.lsp4j.ShowDocumentParams;
 import org.eclipse.lsp4j.ShowDocumentResult;
 import org.eclipse.lsp4j.ShowMessageRequestParams;
+import org.eclipse.lsp4j.Unregistration;
 import org.eclipse.lsp4j.UnregistrationParams;
 import org.eclipse.lsp4j.WorkDoneProgressCreateParams;
 import org.eclipse.lsp4j.WorkspaceDiagnosticParams;
@@ -155,12 +158,29 @@ public class DefaultLanguageClient implements LanguageClient {
 
 	@Override
 	public CompletableFuture<@Nullable Void> registerCapability(RegistrationParams params) {
-		return CompletableFuture.runAsync(() -> wrapper.registerCapability(params));
+		return CompletableFuture.runAsync(() -> {
+			wrapper.registerCapability(params);
+			pullDiagnosticsAgainIfRegistered(params.getRegistrations().stream().map(Registration::getMethod));
+		});
 	}
 
 	@Override
 	public CompletableFuture<@Nullable Void> unregisterCapability(UnregistrationParams params) {
-		return CompletableFuture.runAsync(() -> wrapper.unregisterCapability(params));
+		return CompletableFuture.runAsync(() -> {
+			wrapper.unregisterCapability(params);
+			pullDiagnosticsAgainIfRegistered(params.getUnregisterations().stream().map(Unregistration::getMethod));
+		});
+	}
+
+	/**
+	 * Pulls the diagnostics of the open documents again if one of the given methods, which were registered
+	 * or unregistered, is the one to pull them with: there is more to pull, or what was pulled for the
+	 * registrations that are gone is not valid anymore.
+	 */
+	private void pullDiagnosticsAgainIfRegistered(Stream<String> methods) {
+		if (methods.anyMatch(LSPMethods.TEXT_DOCUMENT_DIAGNOSTIC::equals)) {
+			PullDiagnosticsReconcilingStrategy.refresh(wrapper);
+		}
 	}
 
 	@Override
