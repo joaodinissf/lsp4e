@@ -40,7 +40,9 @@ import org.eclipse.lsp4j.services.LanguageServer;
 /**
  * Pulls the workspace diagnostics of a language server, for as long as it runs and for each identifier
  * it registered {@code textDocument/diagnostic} with {@code workspaceDiagnostics}. As the specification
- * recommends, {@code workspace/diagnostic} is requested again once answered, after a short delay.
+ * recommends, {@code workspace/diagnostic} is requested again once answered, after a short delay. The
+ * delay grows while the answers bring nothing new, as each request tells the server all that is known
+ * already, and is short again as soon as something is sent to the server or it asks for a refresh.
  * <p>
  * Reports for documents connected to the server are dropped, as those get their diagnostics from
  * {@code textDocument/diagnostic}. Nothing is remembered about them, so that the server reports them in
@@ -55,6 +57,7 @@ import org.eclipse.lsp4j.services.LanguageServer;
 public final class WorkspaceDiagnosticsPuller {
 
 	private static final long DELAY_BETWEEN_PULLS_MS = 2000;
+	private static final long MAX_DELAY_BETWEEN_PULLS_MS = 32_000;
 	private static final String PARTIAL_RESULT_TOKEN_PREFIX = "lsp4e-workspace-diagnostics-"; //$NON-NLS-1$
 	/** The number of consecutive failed requests after which an identifier is not pulled anymore. */
 	private static final int MAX_CONSECUTIVE_ERRORS = 5;
@@ -114,9 +117,20 @@ public final class WorkspaceDiagnosticsPuller {
 		}
 	}
 
-	/** Pulls again the identifiers that were given up on after repeated errors. */
+	/** Pulls again the identifiers that were given up on after repeated errors, and the others soon. */
 	public synchronized void refresh() {
-		pulls.values().forEach(Pull::restart);
+		pulls.values().forEach(pull -> {
+			pull.restart();
+			pull.activity();
+		});
+	}
+
+	/**
+	 * To call when something that may change the diagnostics is sent to the server, so that they are
+	 * pulled again soon.
+	 */
+	public synchronized void activity() {
+		pulls.values().forEach(Pull::activity);
 	}
 
 	/**
@@ -181,6 +195,12 @@ public final class WorkspaceDiagnosticsPuller {
 		private volatile boolean gaveUp;
 		private volatile @Nullable CompletableFuture<WorkspaceDiagnosticReport> pending;
 		private volatile int consecutiveErrors;
+		/** Whether an answer to the last request changed the diagnostics of a document. */
+		private volatile boolean changed;
+		/** The state of the delay before the next request. Guarded by this. */
+		private long delay = DELAY_BETWEEN_PULLS_MS;
+		private boolean activity;
+		private @Nullable CompletableFuture<@Nullable Void> nextRequest;
 		/** The token of the last request, with which the server may send partial results. */
 		private volatile @Nullable String partialResultToken;
 
@@ -194,6 +214,11 @@ public final class WorkspaceDiagnosticsPuller {
 			if (stopped) {
 				return;
 			}
+			synchronized (this) {
+				nextRequest = null;
+				activity = false;
+			}
+			changed = false;
 			final var params = new WorkspaceDiagnosticParams(resultIds.entrySet().stream()
 					// what is known of a document that was opened since is not updated anymore
 					.filter(resultId -> !wrapper.isConnectedTo(LSPEclipseUtils.toUri(resultId.getKey())))
@@ -236,7 +261,27 @@ public final class WorkspaceDiagnosticsPuller {
 					return;
 				}
 			}
-			CompletableFuture.delayedExecutor(DELAY_BETWEEN_PULLS_MS, TimeUnit.MILLISECONDS).execute(this::request);
+			synchronized (this) {
+				delay = changed || activity || ex != null ? DELAY_BETWEEN_PULLS_MS
+						: Math.min(delay * 2, MAX_DELAY_BETWEEN_PULLS_MS);
+				requestAfter(delay);
+			}
+		}
+
+		private void requestAfter(long delay) {
+			assert Thread.holdsLock(this);
+			nextRequest = CompletableFuture.runAsync(this::request,
+					CompletableFuture.delayedExecutor(delay, TimeUnit.MILLISECONDS));
+		}
+
+		synchronized void activity() {
+			activity = true;
+			final var nextRequest = this.nextRequest;
+			if (nextRequest != null && delay > DELAY_BETWEEN_PULLS_MS && nextRequest.cancel(false)) {
+				// waiting for long as nothing changed, which may not hold anymore
+				delay = DELAY_BETWEEN_PULLS_MS;
+				requestAfter(delay);
+			}
 		}
 
 		void partialResult(Object value) {
@@ -286,12 +331,18 @@ public final class WorkspaceDiagnosticsPuller {
 			}
 			final List<Diagnostic> items = report.getWorkspaceFullDocumentDiagnosticReport().getItems();
 			if (!items.equals(diagnostics.put(uri, items))) {
+				changed = true;
 				publish(client, uri);
 			}
 		}
 
 		void stop() {
 			stopped = true;
+			synchronized (this) {
+				if (nextRequest != null) {
+					nextRequest.cancel(false);
+				}
+			}
 			final var pending = this.pending;
 			if (pending != null) {
 				pending.cancel(true);

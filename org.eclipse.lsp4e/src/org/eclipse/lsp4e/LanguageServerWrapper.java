@@ -1027,6 +1027,7 @@ public class LanguageServerWrapper {
 		// ensures the interleaving of document updates and other requests in the UI is mirrored in the
 		// order in which they get dispatched to the server
 		getInitializedServer().thenAcceptAsync(fn, this.dispatcher);
+		workspaceDiagnosticsPuller.activity();
 	}
 
 	/**
@@ -1537,6 +1538,7 @@ public class LanguageServerWrapper {
 					return;
 				serverInContext.getWorkspaceService()
 						.didChangeWatchedFiles(new DidChangeWatchedFilesParams(fileEvents));
+				workspaceDiagnosticsPuller.activity();
 			});
 		}
 

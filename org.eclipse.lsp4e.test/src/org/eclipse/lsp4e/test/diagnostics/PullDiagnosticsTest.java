@@ -262,12 +262,12 @@ public class PullDiagnosticsTest extends AbstractTestWithProject {
 
 		// the server is asked again without anything happening in the IDE
 		message.set("workspace 2");
-		waitForAndAssertCondition(5_000, () -> getMarkerMessages(closedFile).equals(Set.of("workspace 2")));
+		waitForAndAssertCondition(15_000, () -> getMarkerMessages(closedFile).equals(Set.of("workspace 2")));
 		// the document pull wins for a document that is open
 		assertEquals(Set.of("from document pull"), getMarkerMessages(openFile));
 
 		final String closedUri = LSPEclipseUtils.toUri(closedFile).toString();
-		waitForAndAssertCondition(5_000, () -> getWorkspaceDiagnosticRequests(factory).stream()
+		waitForAndAssertCondition(15_000, () -> getWorkspaceDiagnosticRequests(factory).stream()
 				.anyMatch(request -> request.getPreviousResultIds()
 						.equals(List.of(new PreviousResultId(closedUri, "closed workspace 2")))));
 		List<WorkspaceDiagnosticParams> requests = getWorkspaceDiagnosticRequests(factory);
@@ -334,7 +334,7 @@ public class PullDiagnosticsTest extends AbstractTestWithProject {
 		client.registerCapability(new RegistrationParams(
 				List.of(new Registration("registration", LSPMethods.TEXT_DOCUMENT_DIAGNOSTIC, options))))
 				.get(1, TimeUnit.SECONDS);
-		waitForAndAssertCondition(5_000, () -> getWorkspaceDiagnosticRequests(factory).size() >= 2);
+		waitForAndAssertCondition(10_000, () -> getWorkspaceDiagnosticRequests(factory).size() >= 2);
 		assertEquals("dynamic", getWorkspaceDiagnosticRequests(factory).get(0).getIdentifier());
 
 		client.unregisterCapability(new UnregistrationParams(
@@ -427,6 +427,29 @@ public class PullDiagnosticsTest extends AbstractTestWithProject {
 
 		TestUtils.closeEditor(editor, false);
 		waitForAndAssertCondition(5_000, () -> getMarkerMessages(testFile).equals(Set.of("from workspace pull")));
+	}
+
+	@Test
+	public void testWorkspaceDiagnosticsArePulledLessOftenWhileNothingChanges(MockLanguageServerFactory factory)
+			throws Exception {
+		IFile openFile = TestUtils.createUniqueTestFile(project, "");
+		IFile closedFile = TestUtils.createUniqueTestFile(project, "");
+		factory.withCapabilities(() -> withDiagnosticProvider(provider -> provider.setWorkspaceDiagnostics(true)));
+		factory.withConfiguration((idx, server) -> server.getWorkspaceService()
+				.setWorkspaceDiagnostics(params -> CompletableFuture.completedFuture(new WorkspaceDiagnosticReport(
+						params.getPreviousResultIds().isEmpty() ? List.of(workspaceReport(closedFile, "same", "result"))
+								: List.of()))));
+
+		ITextViewer viewer = TestUtils.openTextViewer(openFile);
+		waitForAndAssertCondition(5_000, () -> !getWorkspaceDiagnosticRequests(factory).isEmpty());
+		final long start = System.currentTimeMillis();
+		// 2 seconds after the first answer, which brought something new, then 4 and 8 seconds
+		waitForAndAssertCondition(20_000, () -> getWorkspaceDiagnosticRequests(factory).size() == 4);
+		assertTrue(System.currentTimeMillis() - start > 12_000);
+
+		// the next request would only come after 16 seconds, unless something is sent to the server
+		viewer.getDocument().replace(0, 0, "a");
+		waitForAndAssertCondition(5_000, () -> getWorkspaceDiagnosticRequests(factory).size() == 5);
 	}
 
 	@Test
