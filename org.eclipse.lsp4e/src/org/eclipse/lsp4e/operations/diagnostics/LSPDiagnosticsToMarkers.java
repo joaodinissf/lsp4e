@@ -16,6 +16,7 @@ import java.net.URI;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Objects;
@@ -73,6 +74,8 @@ public class LSPDiagnosticsToMarkers implements Consumer<PublishDiagnosticsParam
 		}
 	};
 
+	private static final int MAX_RESOURCES_PER_JOB_RUN = 500;
+
 	private final String languageServerId;
 	private final String markerType;
 	private final IMarkerAttributeComputer markerAttributeComputer;
@@ -94,7 +97,7 @@ public class LSPDiagnosticsToMarkers implements Consumer<PublishDiagnosticsParam
 			String uri = diagnostics.getUri();
 			IResource resource = LSPEclipseUtils.findResourceFor(uri);
 			if (resource != null && resource.isAccessible()) {
-				updateMarkers(diagnostics, resource);
+				scheduleMarkersUpdate(diagnostics, resource);
 			} else {
 				for (final IEditorReference editorRef : LSPEclipseUtils.findOpenEditorsFor(LSPEclipseUtils.toUri(uri))) {
 					final ITextViewer textViewer = LSPEclipseUtils.getTextViewer(editorRef.getEditor(true));
@@ -138,91 +141,125 @@ public class LSPDiagnosticsToMarkers implements Consumer<PublishDiagnosticsParam
 		}
 	}
 
-	private WorkspaceJob updateMarkers(PublishDiagnosticsParams diagnostics, IResource resource) {
-		final var job = new WorkspaceJob("Update markers from diagnostics") { //$NON-NLS-1$
-			@Override
-			public boolean belongsTo(@Nullable Object family) {
-				return LanguageServerPlugin.FAMILY_UPDATE_MARKERS == family;
-			}
+	/**
+	 * The diagnostics to turn into markers, by resource. Only the last ones published for a resource are
+	 * of interest. Guarded by itself.
+	 */
+	private final Map<IResource, PublishDiagnosticsParams> pendingMarkerUpdates = new LinkedHashMap<>();
 
-			@Override
-			public IStatus runInWorkspace(@Nullable IProgressMonitor monitor) throws CoreException {
-				if (!resource.isAccessible()) {
-					return Status.OK_STATUS;
-				}
+	/**
+	 * Updates the markers of all resources with a single job. A job per resource takes a thread each only
+	 * to wait for the workspace, which exhausts the threads when a server reports thousands of files.
+	 */
+	private final WorkspaceJob updateMarkersJob = new WorkspaceJob("Update markers from diagnostics") { //$NON-NLS-1$
+		@Override
+		public boolean belongsTo(@Nullable Object family) {
+			return LanguageServerPlugin.FAMILY_UPDATE_MARKERS == family;
+		}
 
-				// Ensure that markers updates are not done in parallel
-				synchronized(resource) {
-					doRun();
-				}
-
-				return Status.OK_STATUS;
-			}
-
-			private void doRun() throws CoreException {
-				final var toDeleteMarkers = ArrayUtil
-						.asHashSet(resource.findMarkers(markerType, true, IResource.DEPTH_ZERO));
-				toDeleteMarkers
-						.removeIf(marker -> !Objects.equals(marker.getAttribute(LANGUAGE_SERVER_ID, ""), languageServerId)); //$NON-NLS-1$
-				final var newDiagnostics = new ArrayList<Diagnostic>();
-				final var toUpdate = new HashMap<IMarker, Diagnostic>();
-
-				// A language server can scan the whole project and generate diagnostics for files that are not currently open in the IDE
-				// (the markers will show up in the problem view). If so, need to open the document temporarily but be sure to release it
-				// when we're done
-				IDocument existingDocument = LSPEclipseUtils.getExistingDocument(resource);
-				final boolean hasDiagnostics = !diagnostics.getDiagnostics().isEmpty();
-				boolean temporaryLoadDocument = false;
-				IDocument document = existingDocument;
-				if (hasDiagnostics && document == null) {
-					final @Nullable URI resourceUri = LSPEclipseUtils.toUri(resource);
-					if (resourceUri != null && "file".equals(resourceUri.getScheme())) { //$NON-NLS-1$
-						temporaryLoadDocument = true;
-						document = LSPEclipseUtils.getDocument(resource);
+		@Override
+		public IStatus runInWorkspace(@Nullable IProgressMonitor monitor) {
+			// resource changes are only notified once this returns, so not everything at once
+			for (int i = 0; i < MAX_RESOURCES_PER_JOB_RUN; i++) {
+				final IResource resource;
+				final PublishDiagnosticsParams diagnostics;
+				synchronized (pendingMarkerUpdates) {
+					final var pending = pendingMarkerUpdates.entrySet().iterator();
+					if (!pending.hasNext()) {
+						return Status.OK_STATUS;
 					}
+					final var next = pending.next();
+					resource = next.getKey();
+					diagnostics = next.getValue();
+					pending.remove();
 				}
-				for (Diagnostic diagnostic : diagnostics.getDiagnostics()) {
-					IMarker associatedMarker = getExistingMarkerFor(document, diagnostic, toDeleteMarkers);
-					if (associatedMarker == null) {
-						newDiagnostics.add(diagnostic);
-					} else {
-						toDeleteMarkers.remove(associatedMarker);
-						toUpdate.put(associatedMarker, diagnostic);
-					}
-				}
-
 				try {
-					for (Diagnostic diagnostic : newDiagnostics) {
-						if (resource.exists()) {
-							Map<String, Object> markerAttributes = computeMarkerAttributes(document, diagnostic, resource);
-							resource.createMarker(markerType, markerAttributes);
-						}
-					}
-					for (Entry<IMarker, Diagnostic> entry : toUpdate.entrySet()) {
-						IMarker marker = entry.getKey();
-						if (marker.exists()) {
-							Map<String, Object> markerAttributes = computeMarkerAttributes(document, entry.getValue(), resource);
-							updateMarker(markerAttributes, marker);
-						}
-					}
-					toDeleteMarkers.forEach(t -> {
-						try {
-							t.delete();
-						} catch (CoreException e) {
-							LanguageServerPlugin.logError(e);
-						}
-					});
-				} finally {
-					if (document != null && temporaryLoadDocument) {
-						FileBuffers.getTextFileBufferManager().disconnect(resource.getFullPath(), LocationKind.IFILE, new NullProgressMonitor());
-					}
+					updateMarkers(diagnostics, resource);
+				} catch (CoreException | RuntimeException e) {
+					LanguageServerPlugin.logError(e);
 				}
 			}
-		};
-		job.setSystem(true);
-		job.setRule(resource.getWorkspace().getRuleFactory().markerRule(resource));
-		job.schedule();
-		return job;
+			synchronized (pendingMarkerUpdates) {
+				if (!pendingMarkerUpdates.isEmpty()) {
+					schedule();
+				}
+			}
+			return Status.OK_STATUS;
+		}
+	};
+
+	{
+		updateMarkersJob.setSystem(true);
+	}
+
+	private void scheduleMarkersUpdate(PublishDiagnosticsParams diagnostics, IResource resource) {
+		synchronized (pendingMarkerUpdates) {
+			pendingMarkerUpdates.put(resource, diagnostics);
+		}
+		updateMarkersJob.schedule();
+	}
+
+	private void updateMarkers(PublishDiagnosticsParams diagnostics, IResource resource) throws CoreException {
+		if (!resource.isAccessible()) {
+			return;
+		}
+		final var toDeleteMarkers = ArrayUtil
+				.asHashSet(resource.findMarkers(markerType, true, IResource.DEPTH_ZERO));
+		toDeleteMarkers
+				.removeIf(marker -> !Objects.equals(marker.getAttribute(LANGUAGE_SERVER_ID, ""), languageServerId)); //$NON-NLS-1$
+		final var newDiagnostics = new ArrayList<Diagnostic>();
+		final var toUpdate = new HashMap<IMarker, Diagnostic>();
+
+		// A language server can scan the whole project and generate diagnostics for files that are not currently open in the IDE
+		// (the markers will show up in the problem view). If so, need to open the document temporarily but be sure to release it
+		// when we're done
+		IDocument existingDocument = LSPEclipseUtils.getExistingDocument(resource);
+		final boolean hasDiagnostics = !diagnostics.getDiagnostics().isEmpty();
+		boolean temporaryLoadDocument = false;
+		IDocument document = existingDocument;
+		if (hasDiagnostics && document == null) {
+			final @Nullable URI resourceUri = LSPEclipseUtils.toUri(resource);
+			if (resourceUri != null && "file".equals(resourceUri.getScheme())) { //$NON-NLS-1$
+				temporaryLoadDocument = true;
+				document = LSPEclipseUtils.getDocument(resource);
+			}
+		}
+		for (Diagnostic diagnostic : diagnostics.getDiagnostics()) {
+			IMarker associatedMarker = getExistingMarkerFor(document, diagnostic, toDeleteMarkers);
+			if (associatedMarker == null) {
+				newDiagnostics.add(diagnostic);
+			} else {
+				toDeleteMarkers.remove(associatedMarker);
+				toUpdate.put(associatedMarker, diagnostic);
+			}
+		}
+
+		try {
+			for (Diagnostic diagnostic : newDiagnostics) {
+				if (resource.exists()) {
+					Map<String, Object> markerAttributes = computeMarkerAttributes(document, diagnostic, resource);
+					resource.createMarker(markerType, markerAttributes);
+				}
+			}
+			for (Entry<IMarker, Diagnostic> entry : toUpdate.entrySet()) {
+				IMarker marker = entry.getKey();
+				if (marker.exists()) {
+					Map<String, Object> markerAttributes = computeMarkerAttributes(document, entry.getValue(), resource);
+					updateMarker(markerAttributes, marker);
+				}
+			}
+			toDeleteMarkers.forEach(t -> {
+				try {
+					t.delete();
+				} catch (CoreException e) {
+					LanguageServerPlugin.logError(e);
+				}
+			});
+		} finally {
+			if (document != null && temporaryLoadDocument) {
+				FileBuffers.getTextFileBufferManager().disconnect(resource.getFullPath(), LocationKind.IFILE, new NullProgressMonitor());
+			}
+		}
 	}
 
 	protected void updateMarker(Map<String, Object> targetAttributes, IMarker marker) {
