@@ -38,6 +38,7 @@ import org.eclipse.lsp4e.internal.LSPMethods;
 import org.eclipse.lsp4j.Diagnostic;
 import org.eclipse.lsp4j.DiagnosticRegistrationOptions;
 import org.eclipse.lsp4j.DocumentDiagnosticParams;
+import org.eclipse.lsp4j.DocumentDiagnosticReport;
 import org.eclipse.lsp4j.PublishDiagnosticsParams;
 import org.eclipse.lsp4j.TextDocumentIdentifier;
 import org.eclipse.lsp4j.services.LanguageServer;
@@ -50,8 +51,12 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 	 * a previous document cannot leak into the cache of the current one. The cache is guarded by its own
 	 * monitor.
 	 */
+	/** The last full report of an identifier, with the result id of the last report if the server sent one. */
+	private record Report(@Nullable String resultId, List<Diagnostic> items) {
+	}
+
 	private record DocumentState(@Nullable IDocument document,
-			Map<LanguageServerWrapper, Map<@Nullable String, List<Diagnostic>>> lastDiagnostics) {
+			Map<LanguageServerWrapper, Map<@Nullable String, Report>> lastDiagnostics) {
 	}
 
 	private volatile DocumentState state = new DocumentState(null, new HashMap<>());
@@ -106,14 +111,27 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 	 */
 	private static CompletableFuture<@Nullable Void> pullDiagnostics(LanguageServerWrapper wrapper, LanguageServer ls,
 			TextDocumentIdentifier id, URI uri,
-			Map<LanguageServerWrapper, Map<@Nullable String, List<Diagnostic>>> lastDiagnostics) {
-		final var requests = new HashMap<@Nullable String, CompletableFuture<Optional<List<Diagnostic>>>>();
+			Map<LanguageServerWrapper, Map<@Nullable String, Report>> lastDiagnostics) {
+		final var previousResultIds = new HashMap<@Nullable String, String>();
+		synchronized (lastDiagnostics) {
+			lastDiagnostics.getOrDefault(wrapper, Map.of()).forEach((identifier, report) -> {
+				final String resultId = report.resultId();
+				if (resultId != null) {
+					previousResultIds.put(identifier, resultId);
+				}
+			});
+		}
+		final var requests = new HashMap<@Nullable String, CompletableFuture<Optional<DocumentDiagnosticReport>>>();
 		for (final String identifier : getIdentifiers(wrapper, uri)) {
 			final var param = new DocumentDiagnosticParams(id);
 			param.setIdentifier(identifier);
+			// lets the server answer that nothing changed instead of sending the same diagnostics again
+			final String previousResultId = previousResultIds.get(identifier);
+			if (previousResultId != null) {
+				param.setPreviousResultId(previousResultId);
+			}
 			requests.put(identifier, ls.getTextDocumentService().diagnostic(param) //
-					.thenApply(report -> report.map(d -> Optional.of(d.getItems()),
-							r -> Optional.<List<Diagnostic>>empty()))
+					.thenApply(Optional::ofNullable)
 					.exceptionally(ex -> {
 						if (!CancellationUtil.isRequestCancelledException(ex)) {
 							LanguageServerPlugin.logError(ex);
@@ -123,19 +141,26 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 		}
 		return CompletableFuture.allOf(requests.values().toArray(CompletableFuture[]::new)).thenRun(() -> {
 			synchronized (lastDiagnostics) {
-				final Map<@Nullable String, List<Diagnostic>> last = lastDiagnostics.computeIfAbsent(wrapper,
+				final Map<@Nullable String, Report> last = lastDiagnostics.computeIfAbsent(wrapper,
 						w -> new HashMap<>());
 				last.keySet().retainAll(requests.keySet());
 				AtomicBoolean hasFullReport = new AtomicBoolean();
 				for (final var request : requests.entrySet()) {
-					request.getValue().join().ifPresent(item -> {
-						hasFullReport.set(true);
-						last.put(request.getKey(), item);
+					request.getValue().join().ifPresent(report -> {
+						if (report.isLeft()) {
+							hasFullReport.set(true);
+							last.put(request.getKey(),
+									new Report(report.getLeft().getResultId(), report.getLeft().getItems()));
+						} else {
+							// nothing changed, only the result id to send next time may have
+							last.computeIfPresent(request.getKey(), (identifier,
+									previous) -> new Report(report.getRight().getResultId(), previous.items()));
+						}
 					});
 				}
 				final var client = wrapper.getLanguageClient();
 				if (hasFullReport.get() && client != null) {
-					final var diagnostics = last.values().stream().flatMap(List::stream).toList();
+					final var diagnostics = last.values().stream().flatMap(report -> report.items().stream()).toList();
 					client.publishDiagnostics(new PublishDiagnosticsParams(uri.toString(), diagnostics));
 				}
 			}

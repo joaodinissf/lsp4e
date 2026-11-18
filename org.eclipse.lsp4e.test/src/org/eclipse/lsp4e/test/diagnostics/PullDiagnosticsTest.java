@@ -45,11 +45,14 @@ import org.eclipse.lsp4j.Diagnostic;
 import org.eclipse.lsp4j.DiagnosticRegistrationOptions;
 import org.eclipse.lsp4j.DiagnosticServerCapabilities;
 import org.eclipse.lsp4j.DocumentDiagnosticParams;
+import org.eclipse.lsp4j.DocumentDiagnosticReport;
 import org.eclipse.lsp4j.DocumentFilter;
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.Range;
 import org.eclipse.lsp4j.Registration;
 import org.eclipse.lsp4j.RegistrationParams;
+import org.eclipse.lsp4j.RelatedFullDocumentDiagnosticReport;
+import org.eclipse.lsp4j.RelatedUnchangedDocumentDiagnosticReport;
 import org.eclipse.lsp4j.ServerCapabilities;
 import org.eclipse.lsp4j.TextDocumentServerCapabilities;
 import org.eclipse.lsp4j.jsonrpc.ResponseErrorException;
@@ -205,6 +208,35 @@ public class PullDiagnosticsTest extends AbstractTestWithProject {
 		} finally {
 			strategy.uninstall();
 		}
+	}
+
+	@Test
+	public void testPreviousResultIdIsSentAndUnchangedReportKeepsDiagnostics(MockLanguageServerFactory factory)
+			throws Exception {
+		factory.withCapabilities(() -> withDiagnosticProvider(provider -> {}));
+		factory.withConfiguration((idx, server) -> server.getTextDocumentService().setPullDiagnosticReports(params -> {
+			if (params.getPreviousResultId() == null) {
+				final var full = new RelatedFullDocumentDiagnosticReport(List.of(diagnostic("from full report")));
+				full.setResultId("result 1");
+				return CompletableFuture.completedFuture(new DocumentDiagnosticReport(full));
+			}
+			return CompletableFuture.completedFuture(
+					new DocumentDiagnosticReport(new RelatedUnchangedDocumentDiagnosticReport("result 2")));
+		}));
+
+		IFile testFile = TestUtils.createUniqueTestFile(project, "");
+		ITextViewer viewer = TestUtils.openTextViewer(testFile);
+		waitForAndAssertCondition(5_000, () -> getMarkerMessages(testFile).equals(Set.of("from full report")));
+		assertEquals(null, getDiagnosticRequests(factory).get(0).getPreviousResultId());
+
+		viewer.getDocument().replace(0, 0, "a");
+		waitForAndAssertCondition(5_000, () -> getDiagnosticRequests(factory).stream()
+				.anyMatch(request -> "result 1".equals(request.getPreviousResultId())));
+		// the result id of an unchanged report replaces the one of the full report
+		viewer.getDocument().replace(0, 0, "b");
+		waitForAndAssertCondition(5_000, () -> getDiagnosticRequests(factory).stream()
+				.anyMatch(request -> "result 2".equals(request.getPreviousResultId())));
+		assertEquals(Set.of("from full report"), getMarkerMessages(testFile));
 	}
 
 	private static ResponseErrorException serverCancelled() {
