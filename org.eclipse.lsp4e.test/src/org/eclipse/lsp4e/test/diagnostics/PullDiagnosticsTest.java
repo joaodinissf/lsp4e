@@ -24,6 +24,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
@@ -854,6 +855,83 @@ public class PullDiagnosticsTest extends AbstractTestWithProject {
 		final int requests = cancelling.getDiagnosticRequests().size();
 		// the one that may have been on its way, and one more
 		waitForAndAssertCondition(20_000, () -> cancelling.getDiagnosticRequests().size() >= requests + 2);
+	}
+
+	@Test
+	public void testOtherDocumentsArePulledAgainAfterChangeWithInterFileDependencies(MockLanguageServerFactory factory)
+			throws Exception {
+		assertTrue(isOtherDocumentPulledAgainAfterChange(factory, true));
+	}
+
+	@Test
+	public void testOtherDocumentsAreNotPulledAgainAfterChangeWithoutInterFileDependencies(
+			MockLanguageServerFactory factory) throws Exception {
+		assertFalse(isOtherDocumentPulledAgainAfterChange(factory, false));
+	}
+
+	private boolean isOtherDocumentPulledAgainAfterChange(MockLanguageServerFactory factory,
+			boolean interFileDependencies) throws Exception {
+		IFile changedFile = TestUtils.createUniqueTestFile(project, "");
+		IFile otherFile = TestUtils.createUniqueTestFile(project, "");
+		final var message = new AtomicReference<>("before change");
+		factory.withCapabilities(
+				() -> withDiagnosticProvider(provider -> provider.setInterFileDependencies(interFileDependencies)));
+		factory.withConfiguration((idx, server) -> server.getTextDocumentService().setPullDiagnostics(
+				params -> CompletableFuture.completedFuture(params.getTextDocument().getUri().endsWith(otherFile.getName())
+						? List.of(diagnostic(message.get()))
+						: List.of())));
+
+		TestUtils.openTextViewer(otherFile);
+		ITextViewer viewer = TestUtils.openTextViewer(changedFile);
+		waitForAndAssertCondition(5_000, () -> getMarkerMessages(otherFile).equals(Set.of("before change")));
+		// until after the pulls that follow the opening of an editor
+		waitForCondition(3_000, () -> false);
+
+		message.set("after change");
+		viewer.getDocument().replace(0, 0, "a");
+		return waitForCondition(5_000, () -> getMarkerMessages(otherFile).equals(Set.of("after change")));
+	}
+
+	@Test
+	public void testOtherDocumentsArePulledAgainWhenPullForChangeIsOvertaken(MockLanguageServerFactory factory)
+			throws Exception {
+		IFile changedFile = TestUtils.createUniqueTestFile(project, "");
+		IFile otherFile = TestUtils.createUniqueTestFile(project, "");
+		final var message = new AtomicReference<>("before change");
+		final var slow = new AtomicBoolean();
+		final var slowAnswers = new CopyOnWriteArrayList<CompletableFuture<List<Diagnostic>>>();
+		final var otherPulls = new AtomicInteger();
+		factory.withCapabilities(() -> withDiagnosticProvider(provider -> provider.setInterFileDependencies(true)));
+		factory.withConfiguration((idx, server) -> server.getTextDocumentService().setPullDiagnostics(params -> {
+			if (params.getTextDocument().getUri().endsWith(otherFile.getName())) {
+				otherPulls.incrementAndGet();
+				return CompletableFuture.completedFuture(List.of(diagnostic(message.get())));
+			}
+			if (!slow.get()) {
+				return CompletableFuture.completedFuture(List.of());
+			}
+			final var slowAnswer = new CompletableFuture<List<Diagnostic>>();
+			slowAnswers.add(slowAnswer);
+			return slowAnswer;
+		}));
+
+		TestUtils.openTextViewer(otherFile);
+		ITextViewer viewer = TestUtils.openTextViewer(changedFile);
+		waitForAndAssertCondition(5_000, () -> getMarkerMessages(otherFile).equals(Set.of("before change")));
+		// until after the pulls that follow the opening of an editor
+		waitForCondition(3_000, () -> false);
+
+		slow.set(true);
+		viewer.getDocument().replace(0, 0, "a");
+		waitForAndAssertCondition(5_000, () -> slowAnswers.size() == 1);
+		// the pull for the refresh overtakes the one for the change, which is never answered
+		final int pullsBeforeRefresh = otherPulls.get();
+		factory.getServer().getRemoteProxy().refreshDiagnostics().get(5, TimeUnit.SECONDS);
+		waitForAndAssertCondition(5_000, () -> slowAnswers.size() == 2 && otherPulls.get() > pullsBeforeRefresh);
+
+		message.set("after change");
+		slowAnswers.forEach(slowAnswer -> slowAnswer.complete(List.of()));
+		waitForAndAssertCondition(5_000, () -> getMarkerMessages(otherFile).equals(Set.of("after change")));
 	}
 
 	private static ResponseErrorException serverCancelled(boolean retrigger) {

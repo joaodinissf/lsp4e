@@ -12,8 +12,10 @@
 package org.eclipse.lsp4e.operations.diagnostics;
 
 import java.net.URI;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -69,6 +71,11 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 		List<CompletableFuture<?>> pending = List.of();
 		/** How often in a row the diagnostics were pulled again because the server cancelled. */
 		int retriggers;
+		/**
+		 * Whether the document changed and the other documents were not pulled since. They are once a pull is
+		 * answered for good, which need not be the one for the change, as that may be overtaken or cancelled.
+		 */
+		boolean dependentsOwed;
 
 		ServerState(LanguageServer server) {
 			this.server = server;
@@ -92,6 +99,22 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 	/** The delay before pulling again after a server cancelled, which doubles each time in a row. */
 	private static final long RETRIGGER_DELAY_MS = 500;
 	private static final long MAX_RETRIGGER_DELAY_MS = 8_000;
+
+	/** Why diagnostics are pulled. */
+	private enum Cause {
+		/** The document changed. */
+		CHANGE,
+		/** The server cancelled the request before. */
+		RETRIGGER, OTHER
+	}
+
+	/** The delay before each pull of another document after a document changed. */
+	private static final long DELAY_BETWEEN_DEPENDENT_PULLS_MS = 500;
+	/**
+	 * The strategies of the documents that are still to pull by server, as a document changed that their
+	 * diagnostics may depend on. Guarded by its own monitor.
+	 */
+	private static final Map<LanguageServerWrapper, Deque<PullDiagnosticsReconcilingStrategy>> DEPENDENT_PULLS = new HashMap<>();
 
 	/** The strategies in use, held weakly as not every owner announces the end of a strategy's life. */
 	private static final Set<PullDiagnosticsReconcilingStrategy> INSTANCES = Collections
@@ -174,13 +197,10 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 	 * @param onlyServer the only server to request diagnostics from, or {@code null} for all servers
 	 */
 	private void updateDiagnostics(@Nullable LanguageServerWrapper onlyServer) {
-		pullDiagnostics(onlyServer, false);
+		pullDiagnostics(onlyServer, Cause.OTHER);
 	}
 
-	/**
-	 * @param isRetrigger whether the server is asked again because it cancelled the request before
-	 */
-	private void pullDiagnostics(@Nullable LanguageServerWrapper onlyServer, boolean isRetrigger) {
+	private void pullDiagnostics(@Nullable LanguageServerWrapper onlyServer, Cause cause) {
 		final DocumentState currentState = this.state;
 		final var doc = currentState.document();
 		if (doc == null || !enabled) {
@@ -199,7 +219,7 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 			// not by way of all servers of the document, which starts those that do not run, and only if
 			// this is a document of the server at all
 			if (onlyServer.isActive() && onlyServer.isConnectedTo(uri) && !getIdentifiers(onlyServer, uri).isEmpty()) {
-				onlyServer.execute(ls -> pullDiagnostics(currentState, onlyServer, ls, id, uri, isRetrigger));
+				onlyServer.execute(ls -> pullDiagnostics(currentState, onlyServer, ls, id, uri, cause));
 			}
 			return;
 		}
@@ -207,7 +227,7 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 		// so servers whose diagnostic registrations' documentSelectors don't match are skipped
 		LanguageServers.forDocument(doc) //
 				.withFilter(capabilities -> capabilities.getDiagnosticProvider() != null) //
-				.collectAll((wrapper, ls) -> pullDiagnostics(currentState, wrapper, ls, id, uri, isRetrigger));
+				.collectAll((wrapper, ls) -> pullDiagnostics(currentState, wrapper, ls, id, uri, cause));
 	}
 
 	/**
@@ -249,9 +269,12 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 	 * <p>
 	 * A server that cancels a request without declining to be asked again is asked again after a while,
 	 * unless it was asked again since, for instance on an edit. It cancels while it cannot answer yet.
+	 * <p>
+	 * Once a pull is answered after the document changed, the other documents are pulled from the server if
+	 * it announced that the diagnostics of a document may depend on other documents.
 	 */
 	private CompletableFuture<@Nullable Void> pullDiagnostics(DocumentState state, LanguageServerWrapper wrapper,
-			LanguageServer ls, TextDocumentIdentifier id, URI uri, boolean isRetrigger) {
+			LanguageServer ls, TextDocumentIdentifier id, URI uri, Cause cause) {
 		final var previousResultIds = new HashMap<@Nullable String, String>();
 		final ServerState server;
 		final int pull;
@@ -261,8 +284,11 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 			server = state.servers().compute(wrapper,
 					(w, last) -> last != null && last.server == ls ? last : new ServerState(ls));
 			pull = ++server.pulls;
-			if (!isRetrigger) {
+			if (cause != Cause.RETRIGGER) {
 				server.retriggers = 0;
+			}
+			if (cause == Cause.CHANGE) {
+				server.dependentsOwed = true;
 			}
 			overtaken = server.pending;
 			server.pending = List.of();
@@ -310,9 +336,10 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 		}
 		return CompletableFuture.allOf(requests.values().toArray(CompletableFuture[]::new)).thenRun(() -> {
 			final int retrigger;
+			final boolean dependents;
 			synchronized (state.servers()) {
 				if (state.servers().get(wrapper) != server || server.pulls != pull) {
-					// the server was started or asked again since
+					// the server was started or asked again since, and that pull does what is left to do
 					return;
 				}
 				server.pending = List.of();
@@ -348,6 +375,11 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 					}
 				}
 				retrigger = cancelled.get() ? ++server.retriggers : 0;
+				// not before the server answered what it is asked again after it cancelled
+				dependents = server.dependentsOwed && (retrigger == 0 || retrigger > MAX_RETRIGGERS);
+				if (dependents) {
+					server.dependentsOwed = false;
+				}
 			}
 			// a server that keeps cancelling is asked again on the next edit or refresh
 			if (retrigger > 0 && retrigger <= MAX_RETRIGGERS) {
@@ -359,9 +391,12 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 						}
 					}
 					if (this.state == state) {
-						pullDiagnostics(wrapper, true);
+						pullDiagnostics(wrapper, Cause.RETRIGGER);
 					}
 				});
+			}
+			if (dependents && hasInterFileDependencies(wrapper, uri)) {
+				pullDependents(wrapper);
 			}
 		});
 	}
@@ -376,14 +411,62 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 				.stream().map(DiagnosticRegistrationOptions::getIdentifier).collect(Collectors.toSet());
 	}
 
+	private static boolean hasInterFileDependencies(LanguageServerWrapper wrapper, URI uri) {
+		return wrapper
+				.getRegistrationOptions(uri, LSPMethods.TEXT_DOCUMENT_DIAGNOSTIC, DiagnosticRegistrationOptions.class)
+				.stream().anyMatch(DiagnosticRegistrationOptions::isInterFileDependencies);
+	}
+
+	/**
+	 * Pulls the diagnostics of the other documents from the given server, one after the other so as not to
+	 * ask for all of them at once on each change. Starts over if it is already at it, as the documents that
+	 * were pulled already may depend on the new change too.
+	 */
+	private void pullDependents(LanguageServerWrapper wrapper) {
+		final List<PullDiagnosticsReconcilingStrategy> others;
+		synchronized (INSTANCES) {
+			others = INSTANCES.stream().filter(strategy -> {
+				final URI uri = strategy.state.uri();
+				return strategy != this && strategy.enabled && uri != null && wrapper.isConnectedTo(uri);
+			}).toList();
+		}
+		synchronized (DEPENDENT_PULLS) {
+			// what pulls one after the other ends by itself once there is nothing left, and is not started twice
+			final boolean isPulling = DEPENDENT_PULLS.containsKey(wrapper);
+			if (isPulling || !others.isEmpty()) {
+				DEPENDENT_PULLS.put(wrapper, new ArrayDeque<>(others));
+				if (!isPulling) {
+					pullNextDependent(wrapper);
+				}
+			}
+		}
+	}
+
+	private static void pullNextDependent(LanguageServerWrapper wrapper) {
+		CompletableFuture.delayedExecutor(DELAY_BETWEEN_DEPENDENT_PULLS_MS, TimeUnit.MILLISECONDS).execute(() -> {
+			final PullDiagnosticsReconcilingStrategy next;
+			synchronized (DEPENDENT_PULLS) {
+				final var strategies = DEPENDENT_PULLS.get(wrapper);
+				next = strategies == null ? null : strategies.poll();
+				if (next == null) {
+					DEPENDENT_PULLS.remove(wrapper);
+					return;
+				}
+			}
+			// does nothing for a document that the server is not for, or that is not shown anymore
+			next.updateDiagnostics(wrapper);
+			pullNextDependent(wrapper);
+		});
+	}
+
 	@Override
 	public void reconcile(@Nullable DirtyRegion dirtyRegion, @Nullable IRegion subRegion) {
-		updateDiagnostics();
+		pullDiagnostics(null, Cause.CHANGE);
 	}
 
 	@Override
 	public void reconcile(@Nullable IRegion partition) {
-		updateDiagnostics();
+		pullDiagnostics(null, Cause.CHANGE);
 	}
 
 }

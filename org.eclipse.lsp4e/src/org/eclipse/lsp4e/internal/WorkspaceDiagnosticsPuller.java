@@ -63,9 +63,6 @@ import org.eclipse.lsp4j.services.LanguageServer;
  * of the drive in the other case. A document that has a resource is therefore known by the URI of the
  * resource, whichever way the server writes it.
  * <p>
- * The diagnostics of a document that is open in an editor are not pulled again when another file changes,
- * although they may depend on it.
- * <p>
  * A server may answer a request little by little with partial results, and only complete it when it wants
  * to be asked again. Those are handled like complete answers.
  * <p>
