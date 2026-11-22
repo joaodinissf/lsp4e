@@ -15,6 +15,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
@@ -36,9 +37,11 @@ import org.eclipse.lsp4e.operations.diagnostics.PullDiagnosticsReconcilingStrate
 import org.eclipse.lsp4j.Diagnostic;
 import org.eclipse.lsp4j.DiagnosticRegistrationOptions;
 import org.eclipse.lsp4j.PreviousResultId;
+import org.eclipse.lsp4j.ProgressParams;
 import org.eclipse.lsp4j.PublishDiagnosticsParams;
 import org.eclipse.lsp4j.WorkspaceDiagnosticParams;
 import org.eclipse.lsp4j.WorkspaceDiagnosticReport;
+import org.eclipse.lsp4j.WorkspaceDiagnosticReportPartialResult;
 import org.eclipse.lsp4j.WorkspaceDocumentDiagnosticReport;
 import org.eclipse.lsp4j.services.LanguageClient;
 import org.eclipse.lsp4j.services.LanguageServer;
@@ -61,6 +64,9 @@ import org.eclipse.lsp4j.services.LanguageServer;
  * The diagnostics of a document that is open in an editor are not pulled again when another file changes,
  * although they may depend on it.
  * <p>
+ * A server may answer a request little by little with partial results, and only complete it when it wants
+ * to be asked again. Those are handled like complete answers.
+ * <p>
  * The diagnostics of a document are the union of what each identifier last reported for it.
  * <p>
  * Everything is done one thing at a time by a queue, so that no caller ever waits for a request being
@@ -70,6 +76,7 @@ public final class WorkspaceDiagnosticsPuller {
 
 	private static final long DEFAULT_DELAY_BETWEEN_PULLS_MS = 2000;
 	private static volatile long delayBetweenPulls = DEFAULT_DELAY_BETWEEN_PULLS_MS;
+	private static final String PARTIAL_RESULT_TOKEN_PREFIX = "lsp4e-workspace-diagnostics-"; //$NON-NLS-1$
 	/** The number of consecutive failed requests after which an identifier is not pulled anymore. */
 	private static final int MAX_CONSECUTIVE_ERRORS = 5;
 
@@ -143,6 +150,25 @@ public final class WorkspaceDiagnosticsPuller {
 	/** Pulls again the identifiers that were given up on after repeated errors. */
 	public void refresh() {
 		run(session -> session.pulls.values().forEach(Pull::restart));
+	}
+
+	/**
+	 * Handles the given progress if it is a partial result of one of the requests sent from here.
+	 *
+	 * @return whether the progress was handled
+	 */
+	public boolean notifyProgress(ProgressParams params) {
+		final var token = params.getToken();
+		final var value = params.getValue();
+		if (token == null || value == null || !token.isLeft()
+				|| !token.getLeft().startsWith(PARTIAL_RESULT_TOKEN_PREFIX) || !value.isRight()) {
+			return false;
+		}
+		// a partial result that comes too late is of no interest to anyone else either
+		run(session -> session.pulls.values().stream() //
+				.filter(pull -> token.getLeft().equals(pull.partialResultToken)) //
+				.forEach(pull -> pull.partialResult(value.getRight())));
+		return true;
 	}
 
 	/**
@@ -312,6 +338,8 @@ public final class WorkspaceDiagnosticsPuller {
 		private boolean gaveUp;
 		private @Nullable CompletableFuture<WorkspaceDiagnosticReport> pending;
 		private int consecutiveErrors;
+		/** The token of the last request, with which the server may send partial results. */
+		private @Nullable String partialResultToken;
 		/** The reports that could not be handled, which a server sends again and again, to log them once. */
 		private final Set<String> failures = new HashSet<>();
 
@@ -359,6 +387,9 @@ public final class WorkspaceDiagnosticsPuller {
 			});
 			final var params = new WorkspaceDiagnosticParams(previousResultIds);
 			params.setIdentifier(identifier);
+			final String token = PARTIAL_RESULT_TOKEN_PREFIX + UUID.randomUUID();
+			partialResultToken = token;
+			params.setPartialResultToken(token);
 			CompletableFuture<WorkspaceDiagnosticReport> sending;
 			try {
 				sending = session.server.getWorkspaceService().diagnostic(params);
@@ -407,6 +438,21 @@ public final class WorkspaceDiagnosticsPuller {
 				// a server may take as long as it likes to answer, and will not report the document in
 				// answer to this request: the next one is sent once this one is cancelled
 				pending.cancel(true);
+			}
+		}
+
+		void partialResult(Object value) {
+			if (isStopped()) {
+				return;
+			}
+			try {
+				final var gson = JsonUtil.LSP4J_GSON;
+				final var result = gson.fromJson(gson.toJsonTree(value), WorkspaceDiagnosticReportPartialResult.class);
+				if (result != null) {
+					accept(result.getItems());
+				}
+			} catch (RuntimeException ex) {
+				LanguageServerPlugin.logError(ex);
 			}
 		}
 

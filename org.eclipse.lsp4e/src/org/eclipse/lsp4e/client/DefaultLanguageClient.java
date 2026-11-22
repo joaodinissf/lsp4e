@@ -128,7 +128,9 @@ public class DefaultLanguageClient implements LanguageClient {
 
 	@Override
 	public void notifyProgress(final ProgressParams params) {
-		progressManager.notifyProgress(params);
+		if (!wrapper.getWorkspaceDiagnosticsPuller().notifyProgress(params)) {
+			progressManager.notifyProgress(params);
+		}
 	}
 
 	@Override
