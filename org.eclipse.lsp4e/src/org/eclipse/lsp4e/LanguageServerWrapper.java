@@ -315,7 +315,8 @@ public class LanguageServerWrapper {
 		this.initialProject = project;
 		this.initialPath = initialPath;
 		this.serverDefinition = serverDefinition;
-		this.connectedDocuments = new HashMap<>();
+		// also read without its monitor, by threads that do not connect or disconnect documents
+		this.connectedDocuments = Collections.synchronizedMap(new HashMap<>());
 		String projectName = (project != null && !serverDefinition.isSingleton) ? ("@" + project.getName()) : "";  //$NON-NLS-1$//$NON-NLS-2$
 		final var formatPrefix = "LS-" + serverDefinition.id + projectName; //$NON-NLS-1$
 		final var dispatcherThreadNameFormat = formatPrefix + "#dispatcher"; //$NON-NLS-1$
@@ -973,7 +974,7 @@ public class LanguageServerWrapper {
 	/**
 	 * checks if the wrapper is already connected to the document at the given uri
 	 *
-	 * @noreference test only
+	 * @noreference internal
 	 */
 	public boolean isConnectedTo(URI uri) {
 		return connectedDocuments.containsKey(uri);

@@ -52,6 +52,10 @@ import org.eclipse.lsp4j.Registration;
 import org.eclipse.lsp4j.RegistrationParams;
 import org.eclipse.lsp4j.ServerCapabilities;
 import org.eclipse.lsp4j.TextDocumentServerCapabilities;
+import org.eclipse.lsp4j.WorkspaceDiagnosticParams;
+import org.eclipse.lsp4j.WorkspaceDiagnosticReport;
+import org.eclipse.lsp4j.WorkspaceDocumentDiagnosticReport;
+import org.eclipse.lsp4j.WorkspaceFullDocumentDiagnosticReport;
 import org.eclipse.lsp4j.jsonrpc.ResponseErrorException;
 import org.eclipse.lsp4j.jsonrpc.messages.ResponseError;
 import org.eclipse.lsp4j.jsonrpc.messages.ResponseErrorCode;
@@ -205,6 +209,62 @@ public class PullDiagnosticsTest extends AbstractTestWithProject {
 		} finally {
 			strategy.uninstall();
 		}
+	}
+
+	@Test
+	public void testRefreshPullsOpenDocumentAgain(MockLanguageServerFactory factory) throws Exception {
+		final var message = new AtomicReference<>("before refresh");
+		factory.withCapabilities(() -> withDiagnosticProvider(provider -> {}));
+		factory.withConfiguration((idx, server) -> server.getTextDocumentService()
+				.setPullDiagnostics(params -> CompletableFuture.completedFuture(List.of(diagnostic(message.get())))));
+
+		IFile testFile = TestUtils.createUniqueTestFile(project, "");
+		TestUtils.openTextViewer(testFile);
+		waitForAndAssertCondition(5_000, () -> getMarkerMessages(testFile).equals(Set.of("before refresh")));
+		// until after the pull that follows the opening of an editor, for the refresh to be what pulls again
+		waitForCondition(3_000, () -> false);
+
+		message.set("after refresh");
+		factory.getServer().getRemoteProxy().refreshDiagnostics().get(5, TimeUnit.SECONDS);
+
+		waitForAndAssertCondition(5_000, () -> getMarkerMessages(testFile).equals(Set.of("after refresh")));
+		// the server did not announce workspace diagnostics, so it must not be asked for them
+		assertEquals(List.of(), factory.getServer().getWorkspaceService().getDiagnosticRequests());
+	}
+
+	@Test
+	public void testRefreshPullsWorkspaceDiagnosticsWhenSupported(MockLanguageServerFactory factory) throws Exception {
+		IFile openFile = TestUtils.createUniqueTestFile(project, "");
+		IFile closedFile = TestUtils.createUniqueTestFile(project, "");
+		factory.withCapabilities(() -> withDiagnosticProvider(provider -> {
+			provider.setIdentifier("test-identifier");
+			provider.setWorkspaceDiagnostics(true);
+		}));
+		factory.withConfiguration((idx, server) -> {
+			server.getTextDocumentService().setPullDiagnostics(
+					params -> CompletableFuture.completedFuture(List.of(diagnostic("from document pull"))));
+			server.getWorkspaceService().setWorkspaceDiagnostics(
+					params -> CompletableFuture.completedFuture(new WorkspaceDiagnosticReport(List.of( //
+							workspaceReport(openFile, "from workspace pull"),
+							workspaceReport(closedFile, "from workspace pull")))));
+		});
+
+		TestUtils.openTextViewer(openFile);
+		waitForAndAssertCondition(5_000, () -> getMarkerMessages(openFile).equals(Set.of("from document pull")));
+
+		factory.getServer().getRemoteProxy().refreshDiagnostics().get(5, TimeUnit.SECONDS);
+
+		waitForAndAssertCondition(5_000, () -> getMarkerMessages(closedFile).equals(Set.of("from workspace pull")));
+		// the document pull wins for a document that is open
+		assertEquals(Set.of("from document pull"), getMarkerMessages(openFile));
+		WorkspaceDiagnosticParams request = factory.getServer().getWorkspaceService().getDiagnosticRequests().get(0);
+		assertEquals("test-identifier", request.getIdentifier());
+		assertEquals(List.of(), request.getPreviousResultIds());
+	}
+
+	private static WorkspaceDocumentDiagnosticReport workspaceReport(IFile file, String message) {
+		return new WorkspaceDocumentDiagnosticReport(new WorkspaceFullDocumentDiagnosticReport(
+				List.of(diagnostic(message)), LSPEclipseUtils.toUri(file).toString(), null));
 	}
 
 	private static ResponseErrorException serverCancelled() {

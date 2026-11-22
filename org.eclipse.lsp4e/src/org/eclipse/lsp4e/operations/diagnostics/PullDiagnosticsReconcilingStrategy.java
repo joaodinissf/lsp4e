@@ -12,11 +12,13 @@
 package org.eclipse.lsp4e.operations.diagnostics;
 
 import java.net.URI;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.WeakHashMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -54,8 +56,28 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 			Map<LanguageServerWrapper, Map<@Nullable String, List<Diagnostic>>> lastDiagnostics) {
 	}
 
+	/** The strategies in use, held weakly as not every owner announces the end of a strategy's life. */
+	private static final Set<PullDiagnosticsReconcilingStrategy> INSTANCES = Collections
+			.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
+
 	private volatile DocumentState state = new DocumentState(null, new HashMap<>());
-	private boolean enabled = true;
+	private volatile boolean enabled = true;
+
+	public PullDiagnosticsReconcilingStrategy() {
+		INSTANCES.add(this);
+	}
+
+	/**
+	 * Requests the diagnostics of the given server again for every document that diagnostics are pulled
+	 * for, as a server asks for with {@code workspace/diagnostic/refresh}.
+	 */
+	public static void refresh(LanguageServerWrapper wrapper) {
+		final List<PullDiagnosticsReconcilingStrategy> strategies;
+		synchronized (INSTANCES) {
+			strategies = List.copyOf(INSTANCES);
+		}
+		strategies.forEach(strategy -> strategy.updateDiagnostics(wrapper));
+	}
 
 	@Override
 	public void install(@Nullable ITextViewer textViewer) {
@@ -78,6 +100,13 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 	}
 
 	private void updateDiagnostics() {
+		updateDiagnostics(null);
+	}
+
+	/**
+	 * @param onlyServer the only server to request diagnostics from, or {@code null} for all servers
+	 */
+	private void updateDiagnostics(@Nullable LanguageServerWrapper onlyServer) {
 		final DocumentState currentState = this.state;
 		final var doc = currentState.document();
 		if (doc == null || !enabled) {
@@ -89,6 +118,14 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 		}
 		final URI uri = LSPEclipseUtils.toUri(doc);
 		if (uri == null) {
+			return;
+		}
+		if (onlyServer != null) {
+			// not by way of all servers of the document, which starts those that do not run, and only if
+			// this is a document of the server at all
+			if (onlyServer.isActive() && onlyServer.isConnectedTo(uri) && !getIdentifiers(onlyServer, uri).isEmpty()) {
+				onlyServer.execute(ls -> pullDiagnostics(onlyServer, ls, id, uri, currentState.lastDiagnostics()));
+			}
 			return;
 		}
 		// LanguageServers.forDocument evaluates the filter against the document's effective capabilities,
