@@ -22,6 +22,7 @@ import java.util.Set;
 import java.util.WeakHashMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 import org.eclipse.jdt.annotation.Nullable;
@@ -66,6 +67,8 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 		int pulls;
 		/** The requests of the last pull, until it is answered. */
 		List<CompletableFuture<?>> pending = List.of();
+		/** How often in a row the diagnostics were pulled again because the server cancelled. */
+		int retriggers;
 
 		ServerState(LanguageServer server) {
 			this.server = server;
@@ -79,6 +82,15 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 	 */
 	private record DocumentState(@Nullable IDocument document, Map<LanguageServerWrapper, ServerState> servers) {
 	}
+
+	/**
+	 * How often in a row the diagnostics are pulled again because a server cancelled the request, which
+	 * takes about five minutes.
+	 */
+	private static final int MAX_RETRIGGERS = 40;
+	/** The delay before pulling again after a server cancelled, which doubles each time in a row. */
+	private static final long RETRIGGER_DELAY_MS = 500;
+	private static final long MAX_RETRIGGER_DELAY_MS = 8_000;
 
 	/** The strategies in use, held weakly as not every owner announces the end of a strategy's life. */
 	private static final Set<PullDiagnosticsReconcilingStrategy> INSTANCES = Collections
@@ -131,6 +143,13 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 	 * @param onlyServer the only server to request diagnostics from, or {@code null} for all servers
 	 */
 	private void updateDiagnostics(@Nullable LanguageServerWrapper onlyServer) {
+		pullDiagnostics(onlyServer, false);
+	}
+
+	/**
+	 * @param isRetrigger whether the server is asked again because it cancelled the request before
+	 */
+	private void pullDiagnostics(@Nullable LanguageServerWrapper onlyServer, boolean isRetrigger) {
 		final DocumentState currentState = this.state;
 		final var doc = currentState.document();
 		if (doc == null || !enabled) {
@@ -149,7 +168,7 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 			// not by way of all servers of the document, which starts those that do not run, and only if
 			// this is a document of the server at all
 			if (onlyServer.isActive() && onlyServer.isConnectedTo(uri) && !getIdentifiers(onlyServer, uri).isEmpty()) {
-				onlyServer.execute(ls -> pullDiagnostics(currentState, onlyServer, ls, id, uri));
+				onlyServer.execute(ls -> pullDiagnostics(currentState, onlyServer, ls, id, uri, isRetrigger));
 			}
 			return;
 		}
@@ -157,7 +176,7 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 		// so servers whose diagnostic registrations' documentSelectors don't match are skipped
 		LanguageServers.forDocument(doc) //
 				.withFilter(capabilities -> capabilities.getDiagnosticProvider() != null) //
-				.collectAll((wrapper, ls) -> pullDiagnostics(currentState, wrapper, ls, id, uri));
+				.collectAll((wrapper, ls) -> pullDiagnostics(currentState, wrapper, ls, id, uri, isRetrigger));
 	}
 
 	/**
@@ -194,9 +213,12 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 	 * <p>
 	 * The requests of the pull before are cancelled if they are not answered yet, and their answers are
 	 * ignored. So the answer that nothing changed always is about the last report.
+	 * <p>
+	 * A server that cancels a request without declining to be asked again is asked again after a while,
+	 * unless it was asked again since, for instance on an edit. It cancels while it cannot answer yet.
 	 */
-	private static CompletableFuture<@Nullable Void> pullDiagnostics(DocumentState state,
-			LanguageServerWrapper wrapper, LanguageServer ls, TextDocumentIdentifier id, URI uri) {
+	private CompletableFuture<@Nullable Void> pullDiagnostics(DocumentState state, LanguageServerWrapper wrapper,
+			LanguageServer ls, TextDocumentIdentifier id, URI uri, boolean isRetrigger) {
 		final var previousResultIds = new HashMap<@Nullable String, String>();
 		final ServerState server;
 		final int pull;
@@ -206,6 +228,9 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 			server = state.servers().compute(wrapper,
 					(w, last) -> last != null && last.server == ls ? last : new ServerState(ls));
 			pull = ++server.pulls;
+			if (!isRetrigger) {
+				server.retriggers = 0;
+			}
 			overtaken = server.pending;
 			server.pending = List.of();
 			server.reports.forEach((identifier, report) -> {
@@ -219,6 +244,7 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 		overtaken.forEach(request -> request.cancel(true));
 		final var requests = new HashMap<@Nullable String, CompletableFuture<Optional<DocumentDiagnosticReport>>>();
 		final var sent = new ArrayList<CompletableFuture<?>>();
+		final var cancelled = new AtomicBoolean();
 		for (final String identifier : getIdentifiers(wrapper, uri)) {
 			final var param = new DocumentDiagnosticParams(id);
 			param.setIdentifier(identifier);
@@ -232,6 +258,9 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 			requests.put(identifier, request.thenApply(Optional::ofNullable).exceptionally(ex -> {
 				if (!CancellationUtil.isRequestCancelledException(ex)) {
 					LanguageServerPlugin.logError(ex);
+				} else if (CancellationUtil.isServerCancelledException(ex)
+						&& !CancellationUtil.isRetriggerDeclinedException(ex)) {
+					cancelled.set(true);
 				}
 				return Optional.empty();
 			}));
@@ -247,6 +276,7 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 			sent.forEach(request -> request.cancel(true));
 		}
 		return CompletableFuture.allOf(requests.values().toArray(CompletableFuture[]::new)).thenRun(() -> {
+			final int retrigger;
 			synchronized (state.servers()) {
 				if (state.servers().get(wrapper) != server || server.pulls != pull) {
 					// the server was started or asked again since
@@ -279,6 +309,21 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 					final var diagnostics = last.values().stream().flatMap(report -> report.items().stream()).toList();
 					client.publishDiagnostics(new PublishDiagnosticsParams(uri.toString(), diagnostics));
 				}
+				retrigger = cancelled.get() ? ++server.retriggers : 0;
+			}
+			// a server that keeps cancelling is asked again on the next edit or refresh
+			if (retrigger > 0 && retrigger <= MAX_RETRIGGERS) {
+				final long delay = Math.min(RETRIGGER_DELAY_MS << Math.min(retrigger - 1, 10), MAX_RETRIGGER_DELAY_MS);
+				CompletableFuture.delayedExecutor(delay, TimeUnit.MILLISECONDS).execute(() -> {
+					synchronized (state.servers()) {
+						if (state.servers().get(wrapper) != server || server.pulls != pull) {
+							return;
+						}
+					}
+					if (this.state == state) {
+						pullDiagnostics(wrapper, true);
+					}
+				});
 			}
 		});
 	}

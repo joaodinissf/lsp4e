@@ -45,6 +45,7 @@ import org.eclipse.lsp4e.tests.mock.MockLanguageServer;
 import org.eclipse.lsp4e.tests.mock.MockLanguageServerFactory;
 import org.eclipse.lsp4j.Diagnostic;
 import org.eclipse.lsp4j.DiagnosticRegistrationOptions;
+import org.eclipse.lsp4j.DiagnosticServerCancellationData;
 import org.eclipse.lsp4j.DiagnosticServerCapabilities;
 import org.eclipse.lsp4j.DocumentDiagnosticParams;
 import org.eclipse.lsp4j.DocumentDiagnosticReport;
@@ -367,6 +368,72 @@ public class PullDiagnosticsTest extends AbstractTestWithProject {
 		final var full = new RelatedFullDocumentDiagnosticReport(List.of(diagnostic(message)));
 		full.setResultId(resultId);
 		return new DocumentDiagnosticReport(full);
+	}
+
+	@Test
+	public void testDocumentIsPulledAgainAfterServerCancelled(MockLanguageServerFactory factory) throws Exception {
+		final var cancellations = new AtomicReference<Boolean>(Boolean.TRUE);
+		factory.withCapabilities(() -> withDiagnosticProvider(provider -> {}));
+		factory.withConfiguration((idx, server) -> server.getTextDocumentService().setPullDiagnostics(params -> {
+			final Boolean retrigger = cancellations.get();
+			return retrigger == null ? CompletableFuture.completedFuture(List.of(diagnostic("ready")))
+					: CompletableFuture.failedFuture(serverCancelled(retrigger));
+		}));
+
+		IFile testFile = TestUtils.createUniqueTestFile(project, "");
+		TestUtils.openTextViewer(testFile);
+		// asked again and again while the server cancels, without anything happening in the editor
+		waitForAndAssertCondition(10_000, () -> getDiagnosticRequests(factory).size() > 3);
+		cancellations.set(null);
+		waitForAndAssertCondition(10_000, () -> getMarkerMessages(testFile).equals(Set.of("ready")));
+	}
+
+	@Test
+	public void testDocumentIsNotPulledAgainWhenServerDeclinesRetrigger(MockLanguageServerFactory factory)
+			throws Exception {
+		factory.withCapabilities(() -> withDiagnosticProvider(provider -> {}));
+		factory.withConfiguration((idx, server) -> server.getTextDocumentService()
+				.setPullDiagnostics(params -> CompletableFuture.failedFuture(serverCancelled(false))));
+
+		TestUtils.openTextViewer(TestUtils.createUniqueTestFile(project, ""));
+		waitForAndAssertCondition(5_000, () -> !getDiagnosticRequests(factory).isEmpty());
+		// the pulls on opening the editor, and none after them
+		waitForCondition(3_000, () -> false);
+		final int requests = getDiagnosticRequests(factory).size();
+		assertFalse(waitForCondition(4_000, () -> getDiagnosticRequests(factory).size() > requests));
+	}
+
+	@Test
+	public void testServerThatCancelledIsPulledAgainWhileOtherServerIsPulled(MockLanguageServerFactory factory)
+			throws Exception {
+		// the servers are not always listed in the order they are configured in
+		final var cancellingServer = new AtomicReference<MockLanguageServer>();
+		final var otherServer = new AtomicReference<MockLanguageServer>();
+		factory.withCapabilities(() -> withDiagnosticProvider(provider -> {}));
+		factory.withConfiguration((idx, server) -> {
+			(idx == 0 ? cancellingServer : otherServer).set(server);
+			server.getTextDocumentService()
+					.setPullDiagnostics(params -> idx == 0 ? CompletableFuture.failedFuture(serverCancelled(true))
+							: CompletableFuture.completedFuture(List.of()));
+		});
+
+		TestUtils.openTextViewer(TestUtils.createUniqueTestFileMultiLS(project, ""));
+		waitForAndAssertCondition(5_000, () -> cancellingServer.get() != null && otherServer.get() != null);
+		final var cancelling = cancellingServer.get().getTextDocumentService();
+		waitForAndAssertCondition(5_000, () -> !cancelling.getDiagnosticRequests().isEmpty());
+		// until after the pull that follows the opening of the editor, which is for both servers
+		waitForCondition(3_000, () -> false);
+
+		waitForAndAssertCondition(5_000, () -> otherServer.get().getRemoteProxy() != null);
+		otherServer.get().getRemoteProxy().refreshDiagnostics().get(5, TimeUnit.SECONDS);
+		final int requests = cancelling.getDiagnosticRequests().size();
+		// the one that may have been on its way, and one more
+		waitForAndAssertCondition(20_000, () -> cancelling.getDiagnosticRequests().size() >= requests + 2);
+	}
+
+	private static ResponseErrorException serverCancelled(boolean retrigger) {
+		return new ResponseErrorException(new ResponseError(ResponseErrorCode.ServerCancelled, "not ready",
+				new DiagnosticServerCancellationData(retrigger)));
 	}
 
 	private static ResponseErrorException serverCancelled() {
