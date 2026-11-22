@@ -61,6 +61,8 @@ import org.eclipse.lsp4j.services.LanguageServer;
  * The diagnostics of a document that is open in an editor are not pulled again when another file changes,
  * although they may depend on it.
  * <p>
+ * The diagnostics of a document are the union of what each identifier last reported for it.
+ * <p>
  * Everything is done one thing at a time by a queue, so that no caller ever waits for a request being
  * written to the server or for a report being handled, whatever locks it holds.
  */
@@ -113,13 +115,21 @@ public final class WorkspaceDiagnosticsPuller {
 					.filter(DiagnosticRegistrationOptions::isWorkspaceDiagnostics) //
 					.map(DiagnosticRegistrationOptions::getIdentifier) //
 					.collect(Collectors.toSet());
+			final var removed = new ArrayList<Pull>();
 			session.pulls.entrySet().removeIf(pull -> {
 				if (identifiers.contains(pull.getKey())) {
 					return false;
 				}
 				pull.getValue().remove();
+				removed.add(pull.getValue());
 				return true;
 			});
+			// what the identifiers that are gone reported is not valid anymore
+			removed.forEach(pull -> pull.known.forEach((uri, last) -> {
+				if (last.resource != null) {
+					publish(session, uri);
+				}
+			}));
 			for (final @Nullable String identifier : identifiers) {
 				if (!session.pulls.containsKey(identifier)) {
 					final var pull = new Pull(session, identifier);
@@ -226,6 +236,20 @@ public final class WorkspaceDiagnosticsPuller {
 	 */
 	private boolean isPulledAsDocument(URI uri) {
 		return wrapper.isConnectedTo(uri) && PullDiagnosticsReconcilingStrategy.isPulling(wrapper, uri);
+	}
+
+	private void publish(Session session, URI uri) {
+		if (isPulledAsDocument(uri)) {
+			return;
+		}
+		final var diagnostics = new ArrayList<Diagnostic>();
+		for (final Pull pull : session.pulls.values()) {
+			final Known known = pull.known.get(uri);
+			if (known != null) {
+				diagnostics.addAll(known.diagnostics);
+			}
+		}
+		session.client.publishDiagnostics(new PublishDiagnosticsParams(uri.toString(), diagnostics));
 	}
 
 	/** Runs tasks one at a time, in the order they were given. */
@@ -445,7 +469,7 @@ public final class WorkspaceDiagnosticsPuller {
 			final List<Diagnostic> diagnostics = items == null ? List.of() : items;
 			known.put(uri, new Known(full.getUri(), full.getResultId(), resource, diagnostics));
 			if (last == null || !last.diagnostics.equals(diagnostics)) {
-				session.client.publishDiagnostics(new PublishDiagnosticsParams(uri.toString(), diagnostics));
+				publish(session, uri);
 			}
 		}
 

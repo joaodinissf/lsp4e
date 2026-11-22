@@ -555,6 +555,41 @@ public class PullDiagnosticsTest extends AbstractTestWithProject {
 				.anyMatch(request -> request.getPreviousResultIds().equals(List.of(new PreviousResultId(uri, "result")))));
 	}
 
+	@Test
+	public void testWorkspaceDiagnosticsOfSeveralIdentifiersAreMerged(MockLanguageServerFactory factory)
+			throws Exception {
+		IFile openFile = TestUtils.createUniqueTestFile(project, "");
+		IFile closedFile = TestUtils.createUniqueTestFile(project, "");
+		factory.withConfiguration((idx, server) -> server.getWorkspaceService()
+				.setWorkspaceDiagnostics(params -> CompletableFuture.completedFuture(new WorkspaceDiagnosticReport(List.of( //
+						workspaceReport(closedFile, "from " + params.getIdentifier(), params.getIdentifier()),
+						// a document that is not in the workspace is ignored
+						new WorkspaceDocumentDiagnosticReport(new WorkspaceFullDocumentDiagnosticReport(
+								List.of(diagnostic("nowhere to show")), "file:///not/in/the/workspace.lspt", null)))))));
+		TestUtils.openTextViewer(openFile);
+		IDocument document = LSPEclipseUtils.getDocument(openFile);
+		assertNotNull(document);
+		LanguageServers.forDocument(document).collectAll(ls -> CompletableFuture.completedFuture(ls))
+				.get(5, TimeUnit.SECONDS);
+
+		final var registrations = new ArrayList<Registration>();
+		for (String identifier : List.of("syntax", "semantic")) {
+			final var options = new DiagnosticRegistrationOptions(false, true);
+			options.setIdentifier(identifier);
+			registrations.add(new Registration(identifier, LSPMethods.TEXT_DOCUMENT_DIAGNOSTIC, options));
+		}
+		final var client = factory.getServer().getRemoteProxy();
+		client.registerCapability(new RegistrationParams(registrations)).get(1, TimeUnit.SECONDS);
+		// the reports of all identifiers are published together, rather than replacing each other
+		waitForAndAssertCondition(5_000,
+				() -> getMarkerMessages(closedFile).equals(Set.of("from syntax", "from semantic")));
+
+		// what an identifier reported goes away with its registration
+		client.unregisterCapability(new UnregistrationParams(
+				List.of(new Unregistration("syntax", LSPMethods.TEXT_DOCUMENT_DIAGNOSTIC)))).get(1, TimeUnit.SECONDS);
+		waitForAndAssertCondition(5_000, () -> getMarkerMessages(closedFile).equals(Set.of("from semantic")));
+	}
+
 	private static WorkspaceDocumentDiagnosticReport workspaceReport(IFile file, String message, String resultId) {
 		final var report = new WorkspaceFullDocumentDiagnosticReport(List.of(diagnostic(message)),
 				LSPEclipseUtils.toUri(file).toString(), null);
