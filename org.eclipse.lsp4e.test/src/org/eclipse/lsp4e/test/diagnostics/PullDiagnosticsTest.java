@@ -594,6 +594,32 @@ public class PullDiagnosticsTest extends AbstractTestWithProject {
 	}
 
 	@Test
+	public void testWorkspaceDiagnosticsArePulledLessOftenWhileNothingChanges(MockLanguageServerFactory factory)
+			throws Exception {
+		IFile openFile = TestUtils.createUniqueTestFile(project, "");
+		IFile closedFile = TestUtils.createUniqueTestFile(project, "");
+		factory.withCapabilities(() -> withDiagnosticProvider(provider -> provider.setWorkspaceDiagnostics(true)));
+		factory.withConfiguration((idx, server) -> server.getWorkspaceService()
+				.setWorkspaceDiagnostics(params -> CompletableFuture.completedFuture(new WorkspaceDiagnosticReport(
+						params.getPreviousResultIds().isEmpty() ? List.of(workspaceReport(closedFile, "same", "result"))
+								: List.of()))));
+
+		WorkspaceDiagnosticsPuller.setDelayBetweenPulls(1000L);
+		// before anything is requested, so that no wait between two requests is missed
+		final long start = System.nanoTime();
+		ITextViewer viewer = TestUtils.openTextViewer(openFile);
+		// a second after the first answer, which brought something new, then two and four seconds
+		waitForAndAssertCondition(30_000, () -> getWorkspaceDiagnosticRequests(factory).size() >= 4);
+		// which cannot take less however slow the test runs, and would take three seconds at a constant pace
+		assertTrue(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start) >= 6_000);
+
+		// the next request would only come after four more seconds, unless something is sent to the server
+		final int requests = getWorkspaceDiagnosticRequests(factory).size();
+		viewer.getDocument().replace(0, 0, "a");
+		waitForAndAssertCondition(2_500, () -> getWorkspaceDiagnosticRequests(factory).size() > requests);
+	}
+
+	@Test
 	public void testPartialWorkspaceDiagnosticResults(MockLanguageServerFactory factory) throws Exception {
 		IFile openFile = TestUtils.createUniqueTestFile(project, "");
 		IFile closedFile = TestUtils.createUniqueTestFile(project, "");

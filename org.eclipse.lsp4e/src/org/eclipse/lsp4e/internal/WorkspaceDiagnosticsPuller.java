@@ -49,7 +49,9 @@ import org.eclipse.lsp4j.services.LanguageServer;
 /**
  * Pulls the workspace diagnostics of a language server, for as long as it runs and for each identifier
  * it registered {@code textDocument/diagnostic} with {@code workspaceDiagnostics}.
- * {@code workspace/diagnostic} is requested again once answered, after a short delay.
+ * {@code workspace/diagnostic} is requested again once answered, after a short delay. The delay grows
+ * while the answers bring nothing new, as each request tells the server all that is known already, and
+ * is short again as soon as something is sent to the server or it asks for a refresh.
  * <p>
  * Reports for documents whose diagnostics are pulled with {@code textDocument/diagnostic} are dropped, as
  * those win. Nothing is remembered about them, so that the server reports them in full again once they
@@ -97,6 +99,11 @@ public final class WorkspaceDiagnosticsPuller {
 	 */
 	public static void setDelayBetweenPulls(@Nullable Long delay) {
 		delayBetweenPulls = delay == null ? DEFAULT_DELAY_BETWEEN_PULLS_MS : delay;
+	}
+
+	/** The delay grows up to this while the answers bring nothing new. */
+	private static long maxDelayBetweenPulls() {
+		return 4 * delayBetweenPulls;
 	}
 
 	/**
@@ -147,9 +154,20 @@ public final class WorkspaceDiagnosticsPuller {
 		});
 	}
 
-	/** Pulls again the identifiers that were given up on after repeated errors. */
+	/** Pulls again the identifiers that were given up on after repeated errors, and the others soon. */
 	public void refresh() {
-		run(session -> session.pulls.values().forEach(Pull::restart));
+		run(session -> session.pulls.values().forEach(pull -> {
+			pull.restart();
+			pull.activity();
+		}));
+	}
+
+	/**
+	 * To call when something that may change the diagnostics is sent to the server, so that they are
+	 * pulled again soon.
+	 */
+	public void activity() {
+		run(session -> session.pulls.values().forEach(Pull::activity));
 	}
 
 	/**
@@ -338,6 +356,15 @@ public final class WorkspaceDiagnosticsPuller {
 		private boolean gaveUp;
 		private @Nullable CompletableFuture<WorkspaceDiagnosticReport> pending;
 		private int consecutiveErrors;
+		/** Whether an answer to the last request changed the diagnostics of a document. */
+		private boolean changed;
+		/** Whether something was sent to the server since the last request. */
+		private boolean activity;
+		private long delay = delayBetweenPulls;
+		/** The next request, while it is scheduled. */
+		private @Nullable CompletableFuture<@Nullable Void> timer;
+		/** When the scheduled request is due, as {@link System#nanoTime()}. */
+		private long due;
 		/** The token of the last request, with which the server may send partial results. */
 		private @Nullable String partialResultToken;
 		/** The reports that could not be handled, which a server sends again and again, to log them once. */
@@ -374,6 +401,14 @@ public final class WorkspaceDiagnosticsPuller {
 			if (isStopped() || pending != null) {
 				return;
 			}
+			final var timer = this.timer;
+			this.timer = null;
+			if (timer != null) {
+				// if it is not what runs this
+				timer.cancel(false);
+			}
+			activity = false;
+			changed = false;
 			settled.clear();
 			// what is known of a document that is pulled as a document since is not updated anymore
 			known.keySet().removeIf(WorkspaceDiagnosticsPuller.this::isPulledAsDocument);
@@ -426,8 +461,32 @@ public final class WorkspaceDiagnosticsPuller {
 					return;
 				}
 			}
-			CompletableFuture.delayedExecutor(delayBetweenPulls, TimeUnit.MILLISECONDS, queue)
-					.execute(this::request);
+			delay = changed || activity || ex != null ? delayBetweenPulls
+					: Math.min(delay * 2, maxDelayBetweenPulls());
+			requestAfter(delay);
+		}
+
+		private void requestAfter(long delay) {
+			final var timer = this.timer;
+			if (timer != null) {
+				timer.cancel(false);
+			}
+			due = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(delay);
+			// a request that is cancelled before its turn does not run
+			this.timer = CompletableFuture.runAsync(this::request,
+					CompletableFuture.delayedExecutor(delay, TimeUnit.MILLISECONDS, queue));
+		}
+
+		void activity() {
+			activity = true;
+			if (timer != null) {
+				// waiting for long as nothing changed, which may not hold anymore. The request is never
+				// put off, as it would be again and again while there is activity.
+				delay = delayBetweenPulls;
+				if (due - System.nanoTime() > TimeUnit.MILLISECONDS.toNanos(delay)) {
+					requestAfter(delay);
+				}
+			}
 		}
 
 		/** Forgets what was reported for the given document, so that the server reports it in full again. */
@@ -439,6 +498,7 @@ public final class WorkspaceDiagnosticsPuller {
 				// answer to this request: the next one is sent once this one is cancelled
 				pending.cancel(true);
 			}
+			activity();
 		}
 
 		void partialResult(Object value) {
@@ -515,6 +575,7 @@ public final class WorkspaceDiagnosticsPuller {
 			final List<Diagnostic> diagnostics = items == null ? List.of() : items;
 			known.put(uri, new Known(full.getUri(), full.getResultId(), resource, diagnostics));
 			if (last == null || !last.diagnostics.equals(diagnostics)) {
+				changed = true;
 				publish(session, uri);
 			}
 		}
@@ -527,7 +588,7 @@ public final class WorkspaceDiagnosticsPuller {
 		void forgetResources(Set<IPath> paths, boolean withoutResource) {
 			// a document may have a resource now, or none anymore
 			keys.clear();
-			known.values().removeIf(last -> {
+			final boolean forgot = known.values().removeIf(last -> {
 				final IResource resource = last.resource;
 				if (resource == null) {
 					return withoutResource;
@@ -540,6 +601,9 @@ public final class WorkspaceDiagnosticsPuller {
 				}
 				return false;
 			});
+			if (forgot) {
+				activity();
+			}
 		}
 
 		void remove() {
