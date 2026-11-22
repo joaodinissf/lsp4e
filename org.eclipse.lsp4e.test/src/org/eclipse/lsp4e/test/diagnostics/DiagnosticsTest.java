@@ -431,6 +431,29 @@ public class DiagnosticsTest extends AbstractTestWithProject {
 		}
 	}
 
+	@Test
+	public void testDiagnosticsOfManyFilesPublishedRepeatedly() throws CoreException {
+		final var files = new ArrayList<IFile>();
+		for (int i = 0; i < 1000; i++) {
+			files.add(TestUtils.createUniqueTestFile(project, "Diagnostic Other Text"));
+		}
+		final var range = new Range(new Position(0, 0), new Position(0, 10));
+		for (String message : List.of("first", "last")) {
+			for (IFile file : files) {
+				diagnosticsToMarkers.accept(new PublishDiagnosticsParams(file.getLocationURI().toString(),
+						List.of(createDiagnostic("1", message, range, DiagnosticSeverity.Error, "source"))));
+			}
+		}
+
+		// what was published last for a file is what its markers show
+		waitForAndAssertCondition(30_000, () -> {
+			final IMarker[] markers = project.findMarkers(LSPDiagnosticsToMarkers.LS_DIAGNOSTIC_MARKER_TYPE, false,
+					IResource.DEPTH_INFINITE);
+			return markers.length == files.size() && Stream.of(markers)
+					.allMatch(marker -> marker.getAttribute(IMarker.MESSAGE, "").startsWith("last"));
+		});
+	}
+
 	private void confirmResourceChanges(IFile file, Diagnostic diagnostic, int expectedChanges) {
 		IWorkspace workspace = ResourcesPlugin.getWorkspace();
 		final var redrawCountListener = new MarkerRedrawCountListener();
