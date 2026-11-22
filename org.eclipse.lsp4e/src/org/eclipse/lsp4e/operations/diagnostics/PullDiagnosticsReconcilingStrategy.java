@@ -80,7 +80,8 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 	 * {@link #setDocument(IDocument)}, so responses to requests for a previous document cannot leak into
 	 * what is known of the current one. The map is guarded by its own monitor.
 	 */
-	private record DocumentState(@Nullable IDocument document, Map<LanguageServerWrapper, ServerState> servers) {
+	private record DocumentState(@Nullable IDocument document, @Nullable URI uri,
+			Map<LanguageServerWrapper, ServerState> servers) {
 	}
 
 	/**
@@ -96,7 +97,7 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 	private static final Set<PullDiagnosticsReconcilingStrategy> INSTANCES = Collections
 			.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
 
-	private volatile DocumentState state = new DocumentState(null, new HashMap<>());
+	private volatile DocumentState state = new DocumentState(null, null, new HashMap<>());
 	private volatile boolean enabled = true;
 
 	public PullDiagnosticsReconcilingStrategy() {
@@ -115,6 +116,32 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 		strategies.forEach(strategy -> strategy.updateDiagnostics(wrapper));
 	}
 
+	/**
+	 * @return whether the diagnostics of the given document are pulled from the given server, in which
+	 *         case they win over the workspace diagnostics of the server for the document
+	 */
+	public static boolean isPulling(LanguageServerWrapper wrapper, URI uri) {
+		synchronized (INSTANCES) {
+			if (INSTANCES.stream().noneMatch(strategy -> strategy.enabled && uri.equals(strategy.state.uri()))) {
+				return false;
+			}
+		}
+		return !getIdentifiers(wrapper, uri).isEmpty();
+	}
+
+	/** Lets the workspace diagnostics take over for the document of the given state. */
+	private static void stoppedPulling(DocumentState state) {
+		final URI uri = state.uri();
+		if (uri == null) {
+			return;
+		}
+		final List<LanguageServerWrapper> wrappers;
+		synchronized (state.servers()) {
+			wrappers = List.copyOf(state.servers().keySet());
+		}
+		wrappers.forEach(wrapper -> wrapper.getWorkspaceDiagnosticsPuller().forget(uri));
+	}
+
 	@Override
 	public void install(@Nullable ITextViewer textViewer) {
 		enabled = true;
@@ -124,11 +151,15 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 	@Override
 	public void uninstall() {
 		enabled = false;
+		stoppedPulling(state);
 	}
 
 	@Override
 	public void setDocument(@Nullable IDocument document) {
-		this.state = new DocumentState(document, new HashMap<>());
+		final DocumentState previous = this.state;
+		this.state = new DocumentState(document, document == null ? null : LSPEclipseUtils.toUri(document),
+				new HashMap<>());
+		stoppedPulling(previous);
 		// delay update on document set as server could be initializing and the registration options for textdocument/diagnostic
 		// capability not yet sent. Delaying can then prevent from synchronization issues without being perceived as annoyance
 		// by users at this stage as the editor is initializing in other ways as well.
@@ -201,6 +232,8 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 			if (server != null && client != null) {
 				server.pending.forEach(request -> request.cancel(true));
 				client.publishDiagnostics(new PublishDiagnosticsParams(uri.toString(), List.of()));
+				// the workspace diagnostics are the ones to show from now on, if there are any
+				wrapper.getWorkspaceDiagnosticsPuller().forget(uri);
 			}
 		}
 	}
@@ -308,6 +341,11 @@ public class PullDiagnosticsReconcilingStrategy implements IReconcilingStrategy,
 				if (changed && client != null) {
 					final var diagnostics = last.values().stream().flatMap(report -> report.items().stream()).toList();
 					client.publishDiagnostics(new PublishDiagnosticsParams(uri.toString(), diagnostics));
+					if (!isPulling(wrapper, uri)) {
+						// the answer came after the editor was closed, or the server registers no identifier
+						// for the document anymore: the workspace diagnostics are the ones to show
+						wrapper.getWorkspaceDiagnosticsPuller().forget(uri);
+					}
 				}
 				retrigger = cancelled.get() ? ++server.retriggers : 0;
 			}

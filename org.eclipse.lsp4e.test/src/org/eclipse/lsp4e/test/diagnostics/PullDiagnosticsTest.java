@@ -15,6 +15,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.ByteArrayInputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -37,6 +38,7 @@ import org.eclipse.jface.text.ITextViewer;
 import org.eclipse.lsp4e.LSPEclipseUtils;
 import org.eclipse.lsp4e.LanguageServers;
 import org.eclipse.lsp4e.internal.LSPMethods;
+import org.eclipse.lsp4e.internal.WorkspaceDiagnosticsPuller;
 import org.eclipse.lsp4e.operations.diagnostics.LSPDiagnosticsToMarkers;
 import org.eclipse.lsp4e.operations.diagnostics.PullDiagnosticsReconcilingStrategy;
 import org.eclipse.lsp4e.test.utils.AbstractTestWithProject;
@@ -51,6 +53,7 @@ import org.eclipse.lsp4j.DocumentDiagnosticParams;
 import org.eclipse.lsp4j.DocumentDiagnosticReport;
 import org.eclipse.lsp4j.DocumentFilter;
 import org.eclipse.lsp4j.Position;
+import org.eclipse.lsp4j.PreviousResultId;
 import org.eclipse.lsp4j.Range;
 import org.eclipse.lsp4j.Registration;
 import org.eclipse.lsp4j.RegistrationParams;
@@ -64,12 +67,26 @@ import org.eclipse.lsp4j.WorkspaceDiagnosticParams;
 import org.eclipse.lsp4j.WorkspaceDiagnosticReport;
 import org.eclipse.lsp4j.WorkspaceDocumentDiagnosticReport;
 import org.eclipse.lsp4j.WorkspaceFullDocumentDiagnosticReport;
+import org.eclipse.lsp4j.WorkspaceUnchangedDocumentDiagnosticReport;
 import org.eclipse.lsp4j.jsonrpc.ResponseErrorException;
 import org.eclipse.lsp4j.jsonrpc.messages.ResponseError;
 import org.eclipse.lsp4j.jsonrpc.messages.ResponseErrorCode;
+import org.eclipse.ui.IEditorPart;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 public class PullDiagnosticsTest extends AbstractTestWithProject {
+
+	@BeforeEach
+	public void shortenDelayBetweenWorkspacePulls() {
+		WorkspaceDiagnosticsPuller.setDelayBetweenPulls(100L);
+	}
+
+	@AfterEach
+	public void restoreDelayBetweenWorkspacePulls() {
+		WorkspaceDiagnosticsPuller.setDelayBetweenPulls(null);
+	}
 
 	@Test
 	public void testDiagnosticProviderEnablesPullDiagnostics(MockLanguageServerFactory factory) throws Exception {
@@ -241,9 +258,10 @@ public class PullDiagnosticsTest extends AbstractTestWithProject {
 	}
 
 	@Test
-	public void testRefreshPullsWorkspaceDiagnosticsWhenSupported(MockLanguageServerFactory factory) throws Exception {
+	public void testWorkspaceDiagnosticsArePulledRepeatedly(MockLanguageServerFactory factory) throws Exception {
 		IFile openFile = TestUtils.createUniqueTestFile(project, "");
 		IFile closedFile = TestUtils.createUniqueTestFile(project, "");
+		final var message = new AtomicReference<>("workspace 1");
 		factory.withCapabilities(() -> withDiagnosticProvider(provider -> {
 			provider.setIdentifier("test-identifier");
 			provider.setWorkspaceDiagnostics(true);
@@ -253,26 +271,299 @@ public class PullDiagnosticsTest extends AbstractTestWithProject {
 					params -> CompletableFuture.completedFuture(List.of(diagnostic("from document pull"))));
 			server.getWorkspaceService().setWorkspaceDiagnostics(
 					params -> CompletableFuture.completedFuture(new WorkspaceDiagnosticReport(List.of( //
-							workspaceReport(openFile, "from workspace pull"),
-							workspaceReport(closedFile, "from workspace pull")))));
+							workspaceReport(openFile, "from workspace pull", "open " + message.get()),
+							workspaceReport(closedFile, message.get(), "closed " + message.get())))));
 		});
 
 		TestUtils.openTextViewer(openFile);
 		waitForAndAssertCondition(5_000, () -> getMarkerMessages(openFile).equals(Set.of("from document pull")));
+		waitForAndAssertCondition(5_000, () -> getMarkerMessages(closedFile).equals(Set.of("workspace 1")));
 
-		factory.getServer().getRemoteProxy().refreshDiagnostics().get(5, TimeUnit.SECONDS);
-
-		waitForAndAssertCondition(5_000, () -> getMarkerMessages(closedFile).equals(Set.of("from workspace pull")));
+		// the server is asked again without anything happening in the IDE
+		message.set("workspace 2");
+		waitForAndAssertCondition(15_000, () -> getMarkerMessages(closedFile).equals(Set.of("workspace 2")));
 		// the document pull wins for a document that is open
 		assertEquals(Set.of("from document pull"), getMarkerMessages(openFile));
-		WorkspaceDiagnosticParams request = factory.getServer().getWorkspaceService().getDiagnosticRequests().get(0);
-		assertEquals("test-identifier", request.getIdentifier());
-		assertEquals(List.of(), request.getPreviousResultIds());
+
+		final String closedUri = LSPEclipseUtils.toUri(closedFile).toString();
+		waitForAndAssertCondition(15_000, () -> getWorkspaceDiagnosticRequests(factory).stream()
+				.anyMatch(request -> request.getPreviousResultIds()
+						.equals(List.of(new PreviousResultId(closedUri, "closed workspace 2")))));
+		List<WorkspaceDiagnosticParams> requests = getWorkspaceDiagnosticRequests(factory);
+		assertEquals(List.of(), requests.get(0).getPreviousResultIds());
+		assertEquals(Set.of("test-identifier"),
+				requests.stream().map(WorkspaceDiagnosticParams::getIdentifier).collect(Collectors.toSet()));
 	}
 
-	private static WorkspaceDocumentDiagnosticReport workspaceReport(IFile file, String message) {
-		return new WorkspaceDocumentDiagnosticReport(new WorkspaceFullDocumentDiagnosticReport(
-				List.of(diagnostic(message)), LSPEclipseUtils.toUri(file).toString(), null));
+	@Test
+	public void testUnchangedWorkspaceReportKeepsDiagnostics(MockLanguageServerFactory factory) throws Exception {
+		IFile openFile = TestUtils.createUniqueTestFile(project, "");
+		IFile closedFile = TestUtils.createUniqueTestFile(project, "");
+		final String closedUri = LSPEclipseUtils.toUri(closedFile).toString();
+		factory.withCapabilities(() -> withDiagnosticProvider(provider -> provider.setWorkspaceDiagnostics(true)));
+		factory.withConfiguration((idx, server) -> server.getWorkspaceService().setWorkspaceDiagnostics(params -> {
+			final var report = params.getPreviousResultIds().isEmpty()
+					? workspaceReport(closedFile, "from workspace pull", "result 1")
+					: new WorkspaceDocumentDiagnosticReport(
+							new WorkspaceUnchangedDocumentDiagnosticReport("result 2", closedUri, null));
+			return CompletableFuture.completedFuture(new WorkspaceDiagnosticReport(List.of(report)));
+		}));
+
+		TestUtils.openTextViewer(openFile);
+
+		waitForAndAssertCondition(10_000, () -> getWorkspaceDiagnosticRequests(factory).stream()
+				.anyMatch(request -> request.getPreviousResultIds()
+						.equals(List.of(new PreviousResultId(closedUri, "result 2")))));
+		assertEquals(Set.of("from workspace pull"), getMarkerMessages(closedFile));
+	}
+
+	@Test
+	public void testResultIdOfDocumentOpenedAfterItWasReportedIsNotSent(MockLanguageServerFactory factory)
+			throws Exception {
+		IFile otherFile = TestUtils.createUniqueTestFile(project, "");
+		IFile testFile = TestUtils.createUniqueTestFile(project, "");
+		factory.withCapabilities(() -> withDiagnosticProvider(provider -> provider.setWorkspaceDiagnostics(true)));
+		factory.withConfiguration((idx, server) -> server.getWorkspaceService()
+				.setWorkspaceDiagnostics(params -> CompletableFuture.completedFuture(new WorkspaceDiagnosticReport(
+						List.of(workspaceReport(testFile, "from workspace pull", "result"))))));
+
+		TestUtils.openTextViewer(otherFile);
+		waitForAndAssertCondition(5_000, () -> getWorkspaceDiagnosticRequests(factory).stream()
+				.anyMatch(request -> !request.getPreviousResultIds().isEmpty()));
+
+		// what is reported for the document is ignored from now on, so its result id is not the last one
+		TestUtils.openTextViewer(testFile);
+		final int requestsBefore = getWorkspaceDiagnosticRequests(factory).size();
+		waitForAndAssertCondition(15_000, () -> getWorkspaceDiagnosticRequests(factory).stream().skip(requestsBefore)
+				.anyMatch(request -> request.getPreviousResultIds().isEmpty()));
+	}
+
+	@Test
+	public void testWorkspaceDiagnosticsFollowDynamicRegistration(MockLanguageServerFactory factory) throws Exception {
+		IFile testFile = TestUtils.createUniqueTestFile(project, "");
+		IDocument document = LSPEclipseUtils.getDocument(testFile);
+		assertNotNull(document);
+		LanguageServers.forDocument(document).collectAll(ls -> CompletableFuture.completedFuture(ls))
+				.get(5, TimeUnit.SECONDS);
+		assertFalse(waitForCondition(1_000, () -> !getWorkspaceDiagnosticRequests(factory).isEmpty()));
+
+		final var options = new DiagnosticRegistrationOptions(false, true);
+		options.setIdentifier("dynamic");
+		final var client = factory.getServer().getRemoteProxy();
+		client.registerCapability(new RegistrationParams(
+				List.of(new Registration("registration", LSPMethods.TEXT_DOCUMENT_DIAGNOSTIC, options))))
+				.get(1, TimeUnit.SECONDS);
+		waitForAndAssertCondition(10_000, () -> getWorkspaceDiagnosticRequests(factory).size() >= 2);
+		assertEquals("dynamic", getWorkspaceDiagnosticRequests(factory).get(0).getIdentifier());
+
+		client.unregisterCapability(new UnregistrationParams(
+				List.of(new Unregistration("registration", LSPMethods.TEXT_DOCUMENT_DIAGNOSTIC))))
+				.get(1, TimeUnit.SECONDS);
+		// until the request that may have been on its way arrived
+		waitForCondition(1_000, () -> false);
+		final int requestsAfterUnregistration = getWorkspaceDiagnosticRequests(factory).size();
+		assertFalse(waitForCondition(2_000,
+				() -> getWorkspaceDiagnosticRequests(factory).size() > requestsAfterUnregistration));
+	}
+
+	@Test
+	public void testWorkspaceDiagnosticsGiveUpOnRepeatedErrors(MockLanguageServerFactory factory) throws Exception {
+		factory.withCapabilities(() -> withDiagnosticProvider(provider -> provider.setWorkspaceDiagnostics(true)));
+		factory.withConfiguration((idx, server) -> server.getWorkspaceService()
+				.setWorkspaceDiagnostics(params -> CompletableFuture.failedFuture(new ResponseErrorException(
+						new ResponseError(ResponseErrorCode.InternalError, "workspace diagnostics failed", null)))));
+
+		TestUtils.openTextViewer(TestUtils.createUniqueTestFile(project, ""));
+
+		// the first request and five more attempts
+		waitForAndAssertCondition(20_000, () -> getWorkspaceDiagnosticRequests(factory).size() == 6);
+		assertFalse(waitForCondition(2_000, () -> getWorkspaceDiagnosticRequests(factory).size() > 6));
+
+		// a refresh is taken as a sign that the server recovered
+		factory.getServer().getRemoteProxy().refreshDiagnostics().get(5, TimeUnit.SECONDS);
+		waitForAndAssertCondition(5_000, () -> getWorkspaceDiagnosticRequests(factory).size() > 6);
+	}
+
+	@Test
+	public void testWorkspaceDiagnosticsArePulledAgainHoweverOftenTheServerCancels(MockLanguageServerFactory factory)
+			throws Exception {
+		factory.withCapabilities(() -> withDiagnosticProvider(provider -> provider.setWorkspaceDiagnostics(true)));
+		factory.withConfiguration((idx, server) -> server.getWorkspaceService()
+				.setWorkspaceDiagnostics(params -> CompletableFuture.failedFuture(new ResponseErrorException(
+						new ResponseError(ResponseErrorCode.ServerCancelled, "workspace diagnostics cancelled",
+								new DiagnosticServerCancellationData(false))))));
+
+		TestUtils.openTextViewer(TestUtils.createUniqueTestFile(project, ""));
+
+		// more often than a failing request is sent again
+		waitForAndAssertCondition(30_000, () -> getWorkspaceDiagnosticRequests(factory).size() > 7);
+	}
+
+	@Test
+	public void testWorkspaceReportThatCannotBeHandledDoesNotSuppressOthers(MockLanguageServerFactory factory)
+			throws Exception {
+		IFile closedFile = TestUtils.createUniqueTestFile(project, "");
+		factory.withCapabilities(() -> withDiagnosticProvider(provider -> provider.setWorkspaceDiagnostics(true)));
+		factory.withConfiguration((idx, server) -> server.getWorkspaceService()
+				.setWorkspaceDiagnostics(params -> CompletableFuture.completedFuture(new WorkspaceDiagnosticReport(List.of( //
+						new WorkspaceDocumentDiagnosticReport(new WorkspaceFullDocumentDiagnosticReport(
+								List.of(diagnostic("nowhere to show")), "not a uri", null)),
+						workspaceReport(closedFile, "from workspace pull", "result"))))));
+
+		TestUtils.openTextViewer(TestUtils.createUniqueTestFile(project, ""));
+
+		waitForAndAssertCondition(5_000, () -> getMarkerMessages(closedFile).equals(Set.of("from workspace pull")));
+	}
+
+	@Test
+	public void testWorkspaceDiagnosticsAreShownAgainWhenFileIsDeletedAndCreatedAgain(MockLanguageServerFactory factory)
+			throws Exception {
+		IFile closedFile = TestUtils.createUniqueTestFile(project, "");
+		final String closedUri = LSPEclipseUtils.toUri(closedFile).toString();
+		factory.withCapabilities(() -> withDiagnosticProvider(provider -> provider.setWorkspaceDiagnostics(true)));
+		// like a server that only reports what the client does not know yet, and does not watch the files
+		factory.withConfiguration((idx, server) -> server.getWorkspaceService().setWorkspaceDiagnostics(
+				params -> CompletableFuture.completedFuture(new WorkspaceDiagnosticReport(params.getPreviousResultIds()
+						.stream().anyMatch(previous -> closedUri.equals(previous.getUri())) ? List.of()
+								: List.of(workspaceReport(closedFile, "from workspace pull", "result"))))));
+
+		TestUtils.openTextViewer(TestUtils.createUniqueTestFile(project, ""));
+		waitForAndAssertCondition(5_000, () -> getMarkerMessages(closedFile).equals(Set.of("from workspace pull")));
+		waitForAndAssertCondition(5_000, () -> getWorkspaceDiagnosticRequests(factory).stream()
+				.anyMatch(request -> !request.getPreviousResultIds().isEmpty()));
+
+		// the markers go away with the file
+		closedFile.delete(true, null);
+		closedFile.create(new ByteArrayInputStream(new byte[0]), true, null);
+		assertEquals(Set.of(), getMarkerMessages(closedFile));
+
+		waitForAndAssertCondition(15_000, () -> getMarkerMessages(closedFile).equals(Set.of("from workspace pull")));
+	}
+
+	@Test
+	public void testWorkspaceDiagnosticsOfDocumentThatIsOpenButNotPulled(MockLanguageServerFactory factory)
+			throws Exception {
+		IFile testFile = TestUtils.createUniqueTestFile(project, "");
+		factory.withCapabilities(() -> withDiagnosticProvider(provider -> provider.setWorkspaceDiagnostics(true)));
+		factory.withConfiguration((idx, server) -> server.getWorkspaceService()
+				.setWorkspaceDiagnostics(params -> CompletableFuture.completedFuture(new WorkspaceDiagnosticReport(
+						List.of(workspaceReport(testFile, "from workspace pull", "result"))))));
+
+		// like an editor that does not pull the diagnostics of its document
+		IDocument document = LSPEclipseUtils.getDocument(testFile);
+		assertNotNull(document);
+		final var wrappers = LanguageServers.forDocument(document)
+				.collectAll((wrapper, ls) -> CompletableFuture.completedFuture(wrapper)).get(5, TimeUnit.SECONDS);
+		assertEquals(1, wrappers.size());
+		assertTrue(wrappers.get(0).isConnectedTo(LSPEclipseUtils.toUri(testFile)));
+
+		waitForAndAssertCondition(5_000, () -> getMarkerMessages(testFile).equals(Set.of("from workspace pull")));
+		assertEquals(List.of(), getDiagnosticRequests(factory));
+	}
+
+	@Test
+	public void testWorkspaceDiagnosticsTakeOverWhenEditorCloses(MockLanguageServerFactory factory) throws Exception {
+		IFile otherFile = TestUtils.createUniqueTestFile(project, "");
+		IFile testFile = TestUtils.createUniqueTestFile(project, "");
+		// a server may write the URI of a document differently than the client does
+		final String testUri = testFile.getLocation().toFile().toURI().toString();
+		assertFalse(testUri.equals(LSPEclipseUtils.toUri(testFile).toString()));
+		final var report = new WorkspaceFullDocumentDiagnosticReport(List.of(diagnostic("from workspace pull")),
+				testUri, null);
+		report.setResultId("result");
+		factory.withCapabilities(() -> withDiagnosticProvider(provider -> provider.setWorkspaceDiagnostics(true)));
+		factory.withConfiguration((idx, server) -> {
+			server.getTextDocumentService().setPullDiagnostics(
+					params -> CompletableFuture.completedFuture(List.of(diagnostic("from document pull"))));
+			// like a server that only reports what the client does not know yet
+			server.getWorkspaceService().setWorkspaceDiagnostics(params -> CompletableFuture
+					.completedFuture(new WorkspaceDiagnosticReport(params.getPreviousResultIds().stream()
+							.anyMatch(previous -> testUri.equals(previous.getUri())) ? List.of()
+									: List.of(new WorkspaceDocumentDiagnosticReport(report)))));
+		});
+
+		// keeps the server running once the editor of the test file is closed
+		TestUtils.openTextViewer(otherFile);
+		waitForAndAssertCondition(5_000, () -> getMarkerMessages(testFile).equals(Set.of("from workspace pull")));
+		waitForAndAssertCondition(5_000, () -> getWorkspaceDiagnosticRequests(factory).stream()
+				.anyMatch(request -> !request.getPreviousResultIds().isEmpty()));
+
+		IEditorPart editor = TestUtils.openEditor(testFile);
+		waitForAndAssertCondition(5_000, () -> getMarkerMessages(testFile).equals(Set.of("from document pull")));
+		// the document pull keeps winning while the document is open
+		assertFalse(waitForCondition(1_500, () -> !getMarkerMessages(testFile).equals(Set.of("from document pull"))));
+
+		TestUtils.closeEditor(editor, false);
+		waitForAndAssertCondition(5_000, () -> getMarkerMessages(testFile).equals(Set.of("from workspace pull")));
+	}
+
+	@Test
+	public void testDocumentPullAnsweredAfterEditorClosedDoesNotReplaceWorkspaceDiagnostics(
+			MockLanguageServerFactory factory) throws Exception {
+		IFile otherFile = TestUtils.createUniqueTestFile(project, "");
+		IFile testFile = TestUtils.createUniqueTestFile(project, "");
+		final String testUri = LSPEclipseUtils.toUri(testFile).toString();
+		final var slowAnswers = new CopyOnWriteArrayList<CompletableFuture<List<Diagnostic>>>();
+		factory.withCapabilities(() -> withDiagnosticProvider(provider -> provider.setWorkspaceDiagnostics(true)));
+		factory.withConfiguration((idx, server) -> {
+			server.getTextDocumentService().setPullDiagnostics(params -> {
+				if (!testUri.equals(params.getTextDocument().getUri())) {
+					return CompletableFuture.completedFuture(List.of());
+				}
+				final var slowAnswer = new CompletableFuture<List<Diagnostic>>();
+				slowAnswers.add(slowAnswer);
+				return slowAnswer;
+			});
+			// like a server that only reports what the client does not know yet
+			server.getWorkspaceService().setWorkspaceDiagnostics(params -> CompletableFuture
+					.completedFuture(new WorkspaceDiagnosticReport(params.getPreviousResultIds().stream()
+							.anyMatch(previous -> testUri.equals(previous.getUri())) ? List.of()
+									: List.of(workspaceReport(testFile, "from workspace pull", "result")))));
+		});
+
+		// keeps the server running once the editor of the test file is closed
+		TestUtils.openTextViewer(otherFile);
+		IEditorPart editor = TestUtils.openEditor(testFile);
+		waitForAndAssertCondition(5_000, () -> !slowAnswers.isEmpty());
+		TestUtils.closeEditor(editor, false);
+		final int requestsAtClose = getWorkspaceDiagnosticRequests(factory).size();
+		waitForAndAssertCondition(5_000, () -> getMarkerMessages(testFile).equals(Set.of("from workspace pull")));
+		waitForAndAssertCondition(5_000, () -> getWorkspaceDiagnosticRequests(factory).stream().skip(requestsAtClose)
+				.anyMatch(request -> !request.getPreviousResultIds().isEmpty()));
+
+		slowAnswers.forEach(slowAnswer -> slowAnswer.complete(List.of(diagnostic("from document pull"))));
+		// which may be shown for a moment
+		waitForCondition(1_500, () -> false);
+		waitForAndAssertCondition(5_000, () -> getMarkerMessages(testFile).equals(Set.of("from workspace pull")));
+	}
+
+	@Test
+	public void testResultIdOfDocumentThatIsNotInTheWorkspaceIsSent(MockLanguageServerFactory factory)
+			throws Exception {
+		final String uri = "file:///not/in/the/workspace.lspt";
+		final var report = new WorkspaceFullDocumentDiagnosticReport(List.of(diagnostic("nowhere to show")), uri, null);
+		report.setResultId("result");
+		factory.withCapabilities(() -> withDiagnosticProvider(provider -> provider.setWorkspaceDiagnostics(true)));
+		factory.withConfiguration((idx, server) -> server.getWorkspaceService().setWorkspaceDiagnostics(
+				params -> CompletableFuture.completedFuture(new WorkspaceDiagnosticReport(
+						List.of(new WorkspaceDocumentDiagnosticReport(report))))));
+
+		TestUtils.openTextViewer(TestUtils.createUniqueTestFile(project, ""));
+
+		// so that the server does not need to report it again each time
+		waitForAndAssertCondition(5_000, () -> getWorkspaceDiagnosticRequests(factory).stream()
+				.anyMatch(request -> request.getPreviousResultIds().equals(List.of(new PreviousResultId(uri, "result")))));
+	}
+
+	private static WorkspaceDocumentDiagnosticReport workspaceReport(IFile file, String message, String resultId) {
+		final var report = new WorkspaceFullDocumentDiagnosticReport(List.of(diagnostic(message)),
+				LSPEclipseUtils.toUri(file).toString(), null);
+		report.setResultId(resultId);
+		return new WorkspaceDocumentDiagnosticReport(report);
+	}
+
+	private static List<WorkspaceDiagnosticParams> getWorkspaceDiagnosticRequests(MockLanguageServerFactory factory) {
+		return factory.getServer().getWorkspaceService().getDiagnosticRequests();
 	}
 
 	@Test
