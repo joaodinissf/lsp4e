@@ -15,10 +15,12 @@ import static org.eclipse.lsp4e.test.utils.TestUtils.waitForAndAssertCondition;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.matchesPattern;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.Collection;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.TimeUnit;
 
@@ -134,6 +136,58 @@ public class LanguageServerWrapperTest extends AbstractTestWithProject {
 			throw new AssertionError("timeout waiting for ForkJoinPool.commonPool to go quiet");
 
 		assertEquals(factory.connectionProviderStartCounter.get(), factory.connectionProviderStopCounter.get());
+	}
+
+
+	/**
+	 * A restart while the server is still being launched must stop that launch, so that its failure does not
+	 * shut down the server started by the restart.
+	 */
+	@Test
+	public void testRestartWhileStartingIsNotUndoneByFailureOfThatStart(MockLanguageServerFactory factory)
+			throws Exception {
+		final var starting = new CountDownLatch(1);
+		final var failStarting = new CountDownLatch(1);
+		factory.withConfiguration((idx, server) -> {
+			if (idx == 1) {
+				// the launch that the restart is called during, which fails once the restart is done
+				starting.countDown();
+				try {
+					failStarting.await(10, TimeUnit.SECONDS);
+				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+				}
+				throw new IllegalStateException("launch failed");
+			}
+		});
+		IFile testFile = TestUtils.createFile(project, "shouldUseExtension.lspt", "");
+		IEditorPart editor = TestUtils.openEditor(testFile);
+		final Collection<LanguageServerWrapper> wrappers = LanguageServiceAccessor.getLSWrappers(testFile,
+				request -> true);
+		assertEquals(1, wrappers.size());
+		final LanguageServerWrapper wrapper = wrappers.iterator().next();
+		try {
+			waitForAndAssertCondition(5_000, wrapper::isActive);
+
+			wrapper.stop();
+			wrapper.start();
+			assertTrue(starting.await(5, TimeUnit.SECONDS));
+			wrapper.restart();
+			failStarting.countDown();
+
+			waitForAndAssertCondition(5_000, wrapper::isActive);
+			// the failure of the launch before comes too late to undo anything
+			assertFalse(TestUtils.waitForCondition(2_000, () -> !wrapper.isActive() || wrapper.startupFailed()));
+			waitForAndAssertCondition(5_000, () -> factory.connectionProviderStartCounter.get()
+					- factory.connectionProviderStopCounter.get() == 1);
+		} finally {
+			failStarting.countDown();
+			TestUtils.closeEditor(editor, false);
+			// nothing is left running for the tests after
+			wrapper.stop();
+			waitForAndAssertCondition(5_000, () -> factory.connectionProviderStartCounter
+					.get() == factory.connectionProviderStopCounter.get());
+		}
 	}
 
 }

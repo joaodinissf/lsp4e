@@ -418,7 +418,9 @@ public class LanguageServerWrapper {
 	 */
 	private synchronized void start(boolean forceRestart) {
 		final var filesToReconnect = new HashMap<URI, IDocument>();
-		if (this.context.languageServer != null) {
+		// a launch that is not done yet is stopped too, or it would go on with the same context as the new
+		// one, and its failure would shut that down
+		if (this.context.languageServer != null || forceRestart && isLaunching()) {
 			if ((isActive() || isLaunching()) && !forceRestart) {
 				return;
 			} else {
